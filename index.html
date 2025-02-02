@@ -1,0 +1,558 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="Cross-Origin-Embedder-Policy" content="require-corp">
+    <meta http-equiv="Cross-Origin-Opener-Policy" content="same-origin">
+    <title>Video Transform App</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --controls-width: 358px;
+            --controls-bg: #737373;
+            --preview-bg: #878787;
+            --timeline-marker: #D9D9D9;
+            --timeline-line: #A3A3A3;
+            --export-btn-bg: #767676;
+            --playback-bg: #1B1B1B;
+        }
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Inter', sans-serif;
+            margin: 0;
+            padding: 0;
+            width: 100vw;
+            height: 100vh;
+            overflow: hidden;
+            background: white;
+            position: relative;
+        }
+
+        .controls-panel {
+            width: var(--controls-width);
+            height: 100%;
+            position: absolute;
+            left: 0;
+            top: 0;
+            background: var(--controls-bg);
+            padding: 20px;
+            overflow-y: auto;
+        }
+
+        .main-content {
+            position: absolute;
+            left: var(--controls-width);
+            top: 0;
+            width: calc(100vw - var(--controls-width));
+            height: 100vh;
+            padding: 0;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            gap: 45.65px;
+            margin: 0;
+        }
+
+        .video-container {
+            width: 912.97px;
+            height: 513.54px;
+            background: var(--preview-bg);
+            position: relative;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            overflow: hidden;
+            margin: 0;
+            padding: 0;
+        }
+
+        #videoCanvas {
+            position: absolute;
+            width: 100%;
+            height: 100%;
+            top: 0;
+            left: 0;
+            margin: 0;
+            padding: 0;
+            display: block;
+        }
+
+        video {
+            display: none;
+        }
+
+        .timeline-container {
+            width: 1087px;
+            height: 111.27px;
+            position: relative;
+            margin-top: 20px;
+        }
+
+        .timeline {
+            width: 970.98px;
+            height: 62.77px;
+            position: absolute;
+            left: 58.01px;
+            top: 48.50px;
+        }
+
+        .timeline-line {
+            width: 742.74px;
+            height: 0.95px;
+            position: absolute;
+            left: 114.12px;
+            top: 69.91px;
+            background: black;
+            position: relative;
+        }
+
+        /* Add grid styling */
+        .timeline-grid {
+            position: absolute;
+            left: 0;
+            top: -30px;
+            width: 100%;
+            height: 60px;
+            display: flex;
+            pointer-events: none;
+        }
+
+        .grid-line {
+            position: absolute;
+            width: 1px;
+            height: 100%;
+            background: rgba(0, 0, 0, 0.1);
+        }
+
+        .grid-label {
+            position: absolute;
+            top: -20px;
+            transform: translateX(-50%);
+            font-size: 10px;
+            color: rgba(0, 0, 0, 0.5);
+        }
+
+        .timeline-markers {
+            position: absolute;
+            left: 112.22px;
+            top: 58.5px;
+            display: flex;
+            gap: 65.62px;
+        }
+
+        .timeline-marker {
+            width: 1.90px;
+            height: 22.82px;
+            background: var(--timeline-marker);
+        }
+
+        .time-display {
+            position: absolute;
+            left: 27.58px;
+            top: 47.55px;
+            font-size: 28.53px;
+            color: black;
+            display: flex;
+            justify-content: space-between;
+            width: 916px;
+        }
+
+        .playback-controls {
+            width: 72.28px;
+            height: 54.21px;
+            background: var(--playback-bg);
+            border-radius: 13.31px;
+            overflow: hidden;
+            position: relative;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .export-button {
+            position: absolute;
+            right: 26px;
+            top: 14px;
+            padding: 9px 26px 8px;
+            background: var(--export-btn-bg);
+            border-radius: 9px;
+            color: white;
+            font-size: 36px;
+            border: none;
+            cursor: pointer;
+        }
+
+        canvas {
+            max-width: 100%;
+            max-height: 100%;
+        }
+
+        #dropZone {
+            position: absolute;
+            inset: 0;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            background: rgba(0, 0, 0, 0.5);
+            color: white;
+            gap: 10px;
+            z-index: 10;
+        }
+
+        #dropZone input[type="file"] {
+            display: none;
+        }
+
+        #dropZone label {
+            padding: 8px 16px;
+            background: white;
+            color: black;
+            border-radius: 4px;
+            cursor: pointer;
+        }
+
+        .thumbnail-markers {
+            position: absolute;
+            left: 114.12px;
+            top: -18.07px;
+            height: 300px;
+            width: 742.74px;
+            position: relative;
+        }
+
+        .thumbnail-marker {
+            width: 116.02px;
+            height: 65.62px;
+            background: var(--timeline-marker);
+            opacity: 0.5;
+            border-radius: 14.27px;
+            border: 1.90px solid black;
+            position: absolute;
+            cursor: grab;
+            transition: opacity 0.2s;
+            background-size: cover;
+            background-position: center;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+        }
+
+        .select-video-btn {
+            width: 30px;
+            height: 30px;
+            border-radius: 50%;
+            border: none;
+            background: rgba(255, 255, 255, 0.9);
+            cursor: pointer;
+            font-size: 16px;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            z-index: 10;
+            transition: background-color 0.2s;
+        }
+
+        .select-video-btn:hover {
+            background: white;
+        }
+
+        .thumbnail-marker:hover {
+            opacity: 0.8;
+        }
+
+        .thumbnail-marker.has-video {
+            opacity: 0.8;
+        }
+
+        .thumbnail-marker.dragging {
+            opacity: 0.8;
+            cursor: grabbing;
+            z-index: 100;
+        }
+
+        .resize-handle {
+            position: absolute;
+            width: 10px;
+            height: 100%;
+            top: 0;
+            cursor: col-resize;
+            background: rgba(0, 0, 0, 0.2);
+            border-radius: 4px;
+            opacity: 0;
+            transition: opacity 0.2s;
+        }
+
+        .resize-handle.left {
+            left: 0;
+        }
+
+        .resize-handle.right {
+            right: 0;
+        }
+
+        .thumbnail-marker:hover .resize-handle {
+            opacity: 1;
+        }
+
+        .resize-handle:hover,
+        .resize-handle:active {
+            opacity: 1;
+            background: rgba(0, 0, 0, 0.4);
+        }
+
+        .vertical-markers {
+            position: absolute;
+            left: 241.56px;
+            top: 47.55px;
+            display: flex;
+            gap: 307.17px;
+        }
+
+        .vertical-marker {
+            width: 5.71px;
+            height: 33.29px;
+            background: var(--timeline-marker);
+            opacity: 0.5;
+        }
+
+        .corner-pin-container {
+            margin-top: 30px;
+            padding: 15px;
+            background: rgba(255, 255, 255, 0.1);
+            border-radius: 8px;
+        }
+
+        .corner-pin-container h3 {
+            color: black;
+            margin-bottom: 15px;
+            font-size: 16px;
+        }
+
+        .corner-pin-canvas-container {
+            position: relative;
+            width: 100%;
+            aspect-ratio: 16/9;
+            margin-bottom: 15px;
+        }
+
+        #cornerPinCanvas {
+            width: 100%;
+            background: #D9D9D9;
+            border-radius: 4px;
+            margin-bottom: 10px;
+        }
+
+        #cornerPinCanvas:active {
+            cursor: grabbing;
+        }
+
+        #resetCornerPin {
+            width: 100%;
+            padding: 8px;
+            background: #767676;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 14px;
+            margin-top: 10px;
+        }
+
+        #resetCornerPin:hover {
+            background: #666666;
+        }
+
+        .transform-controls {
+            margin-bottom: 20px;
+        }
+
+        .transform-control {
+            margin-bottom: 15px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .transform-control label {
+            color: black;
+            width: 80px;
+            font-size: 14px;
+        }
+
+        .transform-control input[type="range"] {
+            flex: 1;
+            margin: 0;
+            background: #D9D9D9;
+            height: 4px;
+            border-radius: 2px;
+            -webkit-appearance: none;
+        }
+
+        .transform-control input[type="range"]::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            width: 12px;
+            height: 12px;
+            background: white;
+            border-radius: 50%;
+            cursor: pointer;
+            border: 1px solid #666;
+        }
+
+        .transform-control span {
+            width: 50px;
+            text-align: right;
+            color: black;
+            font-size: 14px;
+        }
+
+        .action-buttons {
+            margin-top: 20px;
+            display: flex;
+            gap: 10px;
+        }
+
+        .action-buttons button {
+            flex: 1;
+            padding: 8px;
+            border: none;
+            border-radius: 4px;
+            background: #D9D9D9;
+            color: black;
+            cursor: pointer;
+            font-size: 14px;
+        }
+
+        .playback-controls button {
+            width: 100%;
+            height: 100%;
+            border: none;
+            background: none;
+            color: white;
+            font-size: 24px;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .playhead-marker {
+            position: absolute;
+            width: 2px;
+            height: 30px;
+            background-color: #FF0000;
+            top: -15px;
+            transform: translateX(-50%);
+            pointer-events: none;
+            z-index: 10;
+        }
+    </style>
+</head>
+<body>
+    <div class="controls-panel">
+        <div class="transform-controls">
+            <div class="transform-control">
+                <label for="scaleRange">Scale</label>
+                <input type="range" id="scaleRange" min="0.1" max="2" step="0.1" value="1">
+                <span id="scaleValue">1x</span>
+            </div>
+            <div class="transform-control">
+                <label for="rotateRange">Rotate</label>
+                <input type="range" id="rotateRange" min="0" max="360" step="1" value="0">
+                <span id="rotateValue">0°</span>
+            </div>
+            <div class="transform-control">
+                <label for="distortRange">Distort</label>
+                <input type="range" id="distortRange" min="0" max="1" step="0.1" value="0">
+                <span id="distortValue">0</span>
+            </div>
+            <div class="transform-control">
+                <label for="skewX">Skew X</label>
+                <input type="range" id="skewX" min="-1" max="1" step="0.1" value="0">
+                <span id="skewXValue">0</span>
+            </div>
+            <div class="transform-control">
+                <label for="skewY">Skew Y</label>
+                <input type="range" id="skewY" min="-1" max="1" step="0.1" value="0">
+                <span id="skewYValue">0</span>
+            </div>
+            <div class="transform-control">
+                <label for="posX">Position X</label>
+                <input type="range" id="posX" min="-1" max="1" step="0.1" value="0">
+                <span id="posXValue">0</span>
+            </div>
+            <div class="transform-control">
+                <label for="posY">Position Y</label>
+                <input type="range" id="posY" min="-1" max="1" step="0.1" value="0">
+                <span id="posYValue">0</span>
+            </div>
+        </div>
+
+        <div class="corner-pin-container">
+            <h3>Corner Pin</h3>
+            <div class="corner-pin-canvas-container">
+                <canvas id="cornerPinCanvas"></canvas>
+                <button id="resetCornerPin">Reset Corner Pin</button>
+            </div>
+        </div>
+
+        <div class="action-buttons">
+            <button id="applyTransform">Apply Transform</button>
+            <button id="exportVideo">Export</button>
+            <button id="addOverlay">Add Overlay</button>
+            <input type="file" id="overlayUpload" accept="video/*" style="display: none;">
+        </div>
+
+        <div class="progress-bar">
+            <div class="progress-bar-fill"></div>
+        </div>
+    </div>
+
+    <div class="main-content">
+        <div class="video-container">
+            <div id="dropZone">
+                <p>Drag & drop your video here or</p>
+                <label for="videoUpload">Choose File</label>
+                <input type="file" id="videoUpload" accept="video/*">
+            </div>
+            <video id="videoPreview" style="display: none;"></video>
+            <canvas id="videoCanvas"></canvas>
+        </div>
+
+        <div class="timeline-container">
+            <div class="timeline">
+                <div class="timeline-line">
+                    <div class="timeline-grid"></div>
+                </div>
+                <div class="time-display">
+                    <span class="current-time">0:00</span>
+                    <span class="duration">0:00</span>
+                </div>
+                <div class="thumbnail-markers">
+                    <!-- Markers will be added dynamically via JavaScript -->
+                </div>
+            </div>
+        </div>
+
+        <div class="playback-controls">
+            <button id="playPause">▶</button>
+        </div>
+    </div>
+
+    <button class="export-button">Export</button>
+
+    <script type="module" src="/src/main.js"></script>
+</body>
+</html> 
