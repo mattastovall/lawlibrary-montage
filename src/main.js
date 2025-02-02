@@ -7,6 +7,9 @@ const ffmpeg = new FFmpeg({
 });
 let isFFmpegLoaded = false;
 
+// Initialize video worker
+const videoWorker = new Worker(new URL('./videoWorker.js', import.meta.url), { type: 'module' });
+
 // WebGL shader sources
 const vertexShaderSource = `
     attribute vec2 position;
@@ -15,25 +18,11 @@ const vertexShaderSource = `
     uniform vec4 cornerPin;
     uniform vec4 cornerPin2;
     
-    vec2 applyCornerPin(vec2 pos) {
-        vec2 st = vec2(pos.x * 0.5 + 0.5, pos.y * 0.5 + 0.5);
-        
-        vec2 tl = vec2(cornerPin.x, cornerPin.y);
-        vec2 tr = vec2(cornerPin.z, cornerPin.w);
-        vec2 bl = vec2(cornerPin2.x, cornerPin2.y);
-        vec2 br = vec2(cornerPin2.z, cornerPin2.w);
-        
-        vec2 top = mix(tl, tr, st.x);
-        vec2 bottom = mix(bl, br, st.x);
-        vec2 final = mix(bottom, top, st.y);
-        
-        return final;
-    }
-    
     void main() {
-        vec2 cornerPinned = applyCornerPin(position);
-        vec4 transformedPos = transform * vec4(cornerPinned, 0.0, 1.0);
-        gl_Position = transformedPos;
+        // Simple pass-through vertex shader for testing
+        gl_Position = vec4(position, 0.0, 1.0);
+        
+        // Calculate texture coordinates - flip Y coordinate for WebGL
         vTexCoord = vec2(position.x * 0.5 + 0.5, 0.5 - position.y * 0.5);
     }
 `;
@@ -41,19 +30,30 @@ const vertexShaderSource = `
 const fragmentShaderSource = `
     precision mediump float;
     uniform sampler2D videoTexture;
-    uniform float distortAmount;
+    uniform sampler2D lumaTexture;
+    uniform float useLumaMatte;
     varying vec2 vTexCoord;
+
+    // Function to calculate luminance
+    float getLuminance(vec3 color) {
+        return dot(color, vec3(0.299, 0.587, 0.114));
+    }
+
     void main() {
-        vec2 center = vec2(0.5, 0.5);
-        vec2 coord = vTexCoord - center;
-        float distance = length(coord);
-        float distortion = 1.0 + distance * distortAmount;
-        vec2 distortedCoord = coord * distortion + center;
-        if(distortedCoord.x < 0.0 || distortedCoord.x > 1.0 || 
-           distortedCoord.y < 0.0 || distortedCoord.y > 1.0) {
-            gl_FragColor = vec4(0.0, 0.0, 0.0, 0.0);
+        // Sample main video texture
+        vec4 texColor = texture2D(videoTexture, vTexCoord);
+        
+        if (useLumaMatte > 0.5) {
+            // Sample luma matte texture
+            vec4 lumaColor = texture2D(lumaTexture, vTexCoord);
+            
+            // Calculate alpha from luma matte luminance
+            float alpha = getLuminance(lumaColor.rgb);
+            
+            // Apply luma matte alpha to video color
+            gl_FragColor = vec4(texColor.rgb, alpha);
         } else {
-            vec4 texColor = texture2D(videoTexture, distortedCoord);
+            // No luma matte - use original video alpha
             gl_FragColor = texColor;
         }
     }
@@ -152,10 +152,13 @@ let activePoint = null;
 const currentTimeSpan = document.querySelector('.current-time');
 const durationSpan = document.querySelector('.duration');
 
-// Add this function to format time in MM:SS format
+// Update the formatTime function to handle NaN and invalid values
 function formatTime(seconds) {
-    const minutes = Math.floor(seconds / 60);
-    const remainingSeconds = Math.floor(seconds % 60);
+    if (typeof seconds !== 'number' || isNaN(seconds)) {
+        return '0:00';
+    }
+    const minutes = Math.floor(Math.max(0, seconds) / 60);
+    const remainingSeconds = Math.floor(Math.max(0, seconds) % 60);
     return `${minutes}:${remainingSeconds.toString().padStart(2, '0')}`;
 }
 
@@ -172,26 +175,58 @@ let videoMetadata = {
     format: null,
     lastTimeUpdate: 0,
     unexpectedLoops: 0,
-    preventLoop: false
+    preventLoop: false,
+    lastValidTime: 0,
+    endingPrevented: false,
+    wasPlaying: false,
+    lastJumpTime: 0,
+    jumpCount: 0,
+    expectedFrameTime: 1000 / 30, // assuming 30fps
+    lastFrameTimestamp: 0,
+    frameCount: 0,
+    actualEndTime: 0,
+    shouldLoop: true  // Add this flag
 };
 
-// Update WebGL initialization
+// Add DOM elements
+const toggleLumaMatteBtn = document.getElementById('toggleLumaMatte');
+const lumaMatteInput = document.createElement('input');
+lumaMatteInput.type = 'file';
+lumaMatteInput.accept = 'video/*';
+lumaMatteInput.style.display = 'none';
+document.body.appendChild(lumaMatteInput);
+
+// Add luma matte texture
+let lumaTexture;
+
+// Add uniform locations as global variables
+let videoTextureUniform;
+let lumaTextureUniform;
+let useLumaMatteUniform;
+
+// Update initWebGL to store uniform locations
 function initWebGL() {
     gl = canvas.getContext('webgl', { 
-        preserveDrawingBuffer: true,
+        alpha: true,
         premultipliedAlpha: false,
-        alpha: true
+        preserveDrawingBuffer: true,
+        antialias: true
     });
     if (!gl) {
-        alert('WebGL not supported');
+        console.error('WebGL not supported');
         return;
     }
 
-    // Enable alpha blending
+    console.log('WebGL context created successfully');
+
+    // Configure alpha blending
     gl.enable(gl.BLEND);
-    gl.blendFuncSeparate(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+    gl.blendFuncSeparate(
+        gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA,  // RGB channels
+        gl.ONE, gl.ONE_MINUS_SRC_ALPHA         // Alpha channel
+    );
     gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
-    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
 
     // Create shaders
     const vertexShader = gl.createShader(gl.VERTEX_SHADER);
@@ -200,7 +235,9 @@ function initWebGL() {
 
     if (!gl.getShaderParameter(vertexShader, gl.COMPILE_STATUS)) {
         console.error('Vertex shader compile error:', gl.getShaderInfoLog(vertexShader));
+        return;
     }
+    console.log('Vertex shader compiled successfully');
 
     const fragmentShader = gl.createShader(gl.FRAGMENT_SHADER);
     gl.shaderSource(fragmentShader, fragmentShaderSource);
@@ -208,7 +245,9 @@ function initWebGL() {
 
     if (!gl.getShaderParameter(fragmentShader, gl.COMPILE_STATUS)) {
         console.error('Fragment shader compile error:', gl.getShaderInfoLog(fragmentShader));
+        return;
     }
+    console.log('Fragment shader compiled successfully');
 
     // Create program
     program = gl.createProgram();
@@ -218,7 +257,9 @@ function initWebGL() {
 
     if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
         console.error('Program link error:', gl.getProgramInfoLog(program));
+        return;
     }
+    console.log('Program linked successfully');
 
     gl.useProgram(program);
 
@@ -239,28 +280,54 @@ function initWebGL() {
     gl.enableVertexAttribArray(positionAttribute);
     gl.vertexAttribPointer(positionAttribute, 2, gl.FLOAT, false, 0, 0);
 
-    // Create textures for main video and composites
+    // Create textures
     videoTexture = createVideoTexture();
-    rectangles.forEach(rect => {
-        compositeTextures.set(rect.id, createVideoTexture());
-    });
     
-    // Get uniform locations
-    const videoTextureUniform = gl.getUniformLocation(program, 'videoTexture');
+    // Store uniform locations
+    videoTextureUniform = gl.getUniformLocation(program, 'videoTexture');
+    lumaTextureUniform = gl.getUniformLocation(program, 'lumaTexture');
+    useLumaMatteUniform = gl.getUniformLocation(program, 'useLumaMatte');
+    
     gl.uniform1i(videoTextureUniform, 0);  // Use texture unit 0
+    gl.uniform1i(lumaTextureUniform, 1);   // Use texture unit 1
+    gl.uniform1f(useLumaMatteUniform, 0.0);
+    
+    // Set initial viewport
+    gl.viewport(0, 0, canvas.width, canvas.height);
     
     // Set initial uniforms
     updateTransform();
+    
+    // Clear canvas with transparent background
+    gl.clearColor(0.0, 0.0, 0.0, 0.0);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    
+    console.log('WebGL initialized successfully');
 }
 
 // Helper function to create a video texture
 function createVideoTexture() {
     const texture = gl.createTexture();
     gl.bindTexture(gl.TEXTURE_2D, texture);
+    
+    // Set texture parameters for video
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    
+    // Initialize with a 1x1 transparent pixel
+    gl.texImage2D(
+        gl.TEXTURE_2D, 
+        0, 
+        gl.RGBA, 
+        1, 1, 
+        0, 
+        gl.RGBA, 
+        gl.UNSIGNED_BYTE, 
+        new Uint8Array([0, 0, 0, 0])
+    );
+    
     return texture;
 }
 
@@ -451,427 +518,319 @@ function initCornerPin() {
     resetCornerPoints();
 }
 
-// Update transform matrix based on controls
+// Update transform function
 function updateTransform() {
     if (!gl || !program) return;
 
+    // Get values from controls
     const scale = parseFloat(scaleRange.value);
     const rotate = parseFloat(rotateRange.value) * Math.PI / 180;
     const distort = parseFloat(distortRange.value);
-    const skewX = parseFloat(skewXInput.value);
-    const skewY = parseFloat(skewYInput.value);
+    const skewX = parseFloat(skewXInput.value) * Math.PI / 180;
+    const skewY = parseFloat(skewYInput.value) * Math.PI / 180;
     const posX = parseFloat(posXInput.value);
     const posY = parseFloat(posYInput.value);
 
-    // Update display values
-    scaleValue.textContent = `${scale}x`;
-    rotateValue.textContent = `${rotateRange.value}°`;
-    distortValue.textContent = distort.toFixed(1);
-    skewXValue.textContent = skewX.toFixed(2);
-    skewYValue.textContent = skewY.toFixed(2);
-    posXValue.textContent = posX.toFixed(2);
-    posYValue.textContent = posY.toFixed(2);
-
-    // Get base transform values
-    const baseTransform = new Float32Array(transformMatrix);
-    
-    // Apply user transformations
-    const s = Math.sin(rotate);
-    const c = Math.cos(rotate);
-    
-    const finalMatrix = new Float32Array([
-        scale * baseTransform[0] * c + skewX * s, 
-        scale * baseTransform[0] * s - skewX * c,
-        0, 0,
-        -scale * baseTransform[5] * s + skewY * c,
-        scale * baseTransform[5] * c + skewY * s,
-        0, 0,
-        0, 0, 1, 0,
-        posX, -posY, 0, 1
+    // Create transformation matrix
+    const transform = new Float32Array([
+        scale * Math.cos(rotate), -Math.sin(rotate) + Math.tan(skewX),  0, 0,
+        Math.sin(rotate) + Math.tan(skewY),  scale * Math.cos(rotate),  0, 0,
+        0,                       0,                                      1, 0,
+        posX,                    posY,                                   0, 1
     ]);
 
     // Update uniforms
     const transformUniform = gl.getUniformLocation(program, 'transform');
-    gl.uniformMatrix4fv(transformUniform, false, finalMatrix);
+    gl.uniformMatrix4fv(transformUniform, false, transform);
 
     const distortUniform = gl.getUniformLocation(program, 'distortAmount');
     gl.uniform1f(distortUniform, distort);
 
-    // Always use 3840x2160 as the base dimensions for normalization
-    const baseWidth = 3840;
-    const baseHeight = 2160;
-
-    const normTLX = (cornerPoints[0].x / baseWidth) * 2 - 1;
-    const normTLY = 1 - (cornerPoints[0].y / baseHeight) * 2;
-    const normTRX = (cornerPoints[1].x / baseWidth) * 2 - 1;
-    const normTRY = 1 - (cornerPoints[1].y / baseHeight) * 2;
-    const normBLX = (cornerPoints[2].x / baseWidth) * 2 - 1;
-    const normBLY = 1 - (cornerPoints[2].y / baseHeight) * 2;
-    const normBRX = (cornerPoints[3].x / baseWidth) * 2 - 1;
-    const normBRY = 1 - (cornerPoints[3].y / baseHeight) * 2;
-
-    // Update corner pin uniforms with normalized coordinates
-    const cornerPinUniform = gl.getUniformLocation(program, 'cornerPin');
-    gl.uniform4f(cornerPinUniform, normTLX, normTLY, normTRX, normTRY);
-    
-    const cornerPin2Uniform = gl.getUniformLocation(program, 'cornerPin2');
-    gl.uniform4f(cornerPin2Uniform, normBLX, normBLY, normBRX, normBRY);
-
-    renderFrame();
-}
-
-// Add this function after initWebGL()
-function resizeCanvasToFitVideo() {
-    if (!videoPreview.videoWidth || !videoPreview.videoHeight) return;
-    
-    const container = canvas.parentElement;
-    
-    // Set fixed canvas dimensions based on 16:9 aspect ratio
-    canvas.width = 912.97;
-    canvas.height = 513.54;
-    
-    // Calculate scaling factors to fit the video into the fixed canvas
-    const videoAspect = videoPreview.videoWidth / videoPreview.videoHeight;
-    const canvasAspect = canvas.width / canvas.height;
-    
-    let scaleX = 1, scaleY = 1;
-    if (videoAspect > canvasAspect) {
-        // Video is wider - scale to fit width
-        scaleX = 1;
-        scaleY = canvasAspect / videoAspect;
-    } else {
-        // Video is taller - scale to fit height
-        scaleX = videoAspect / canvasAspect;
-        scaleY = 1;
+    // Update corner pin uniforms if needed
+    if (selectedMarker) {
+        const rect = rectangles.find(r => r.id === parseInt(selectedMarker.dataset.id));
+        if (rect && rect.hasCornerPin) {
+            const cornerPinUniform = gl.getUniformLocation(program, 'cornerPin');
+            const cornerPin2Uniform = gl.getUniformLocation(program, 'cornerPin2');
+            
+            gl.uniform4f(cornerPinUniform,
+                rect.cornerPin.topLeft.x, rect.cornerPin.topLeft.y,
+                rect.cornerPin.topRight.x, rect.cornerPin.topRight.y
+            );
+            
+            gl.uniform4f(cornerPin2Uniform,
+                rect.cornerPin.bottomLeft.x, rect.cornerPin.bottomLeft.y,
+                rect.cornerPin.bottomRight.x, rect.cornerPin.bottomRight.y
+            );
+        }
     }
-    
-    // Update WebGL viewport to match canvas size
-    gl.viewport(0, 0, canvas.width, canvas.height);
-    
-    // Calculate translation to center the video
-    const translateX = (1 - scaleX) / 2;
-    const translateY = (1 - scaleY) / 2;
-    
-    // Set base transform matrix to fit and center video
-    transformMatrix = new Float32Array([
-        scaleX, 0, 0, 0,
-        0, scaleY, 0, 0,
-        0, 0, 1, 0,
-        translateX * 2, translateY * 2, 0, 1
-    ]);
-    
-    updateTransform();
 }
 
 // Update render frame function
 function renderFrame() {
-    if (!gl || !videoPreview || !videoTexture) return;
-    if (!videoPreview.videoWidth || !videoPreview.videoHeight) return;
+    if (!gl || !videoPreview || !videoTexture) {
+        console.warn('Missing required resources:', { 
+            gl: !!gl, 
+            videoPreview: !!videoPreview, 
+            videoTexture: !!videoTexture 
+        });
+        return;
+    }
+
+    if (!videoPreview.videoWidth || !videoPreview.videoHeight) {
+        console.warn('Video dimensions not ready');
+        return;
+    }
     
     try {
-        // Only update texture if video is actually playing and ready
-        const shouldUpdateTexture = !videoPreview.paused && 
-                                  videoPreview.readyState >= 3 && 
-                                  !videoPreview.seeking;
-        
+        // Clear canvas with transparent background
         gl.clearColor(0.0, 0.0, 0.0, 0.0);
         gl.clear(gl.COLOR_BUFFER_BIT);
 
-        // First render composite clips (lower z-index)
-        rectangles.forEach(rect => {
-            if (rect.videoElement && 
-                rect.videoElement.readyState >= 3 && 
-                !rect.videoElement.seeking) {
-                const texture = compositeTextures.get(rect.id);
-                if (texture) {
-                    const currentFrame = Math.floor(videoPreview.currentTime * 30);
-                    if (currentFrame >= rect.startFrame && currentFrame <= rect.endFrame) {
-                        // Set clip's video time based on main video time
-                        const clipTime = (currentFrame - rect.startFrame) / 30;
-                        if (Math.abs(rect.videoElement.currentTime - clipTime) > 0.1) {
-                            rect.videoElement.currentTime = clipTime;
-                        }
+        // Set up WebGL state for alpha blending
+        gl.enable(gl.BLEND);
+        gl.blendFuncSeparate(
+            gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA,  // RGB channels
+            gl.ONE, gl.ONE_MINUS_SRC_ALPHA         // Alpha channel
+        );
 
-                        // Apply this rectangle's corner pin coordinates
-                        const baseWidth = 3840;
-                        const baseHeight = 2160;
-
-                        const normTLX = (rect.cornerPin.topLeft.x / baseWidth) * 2 - 1;
-                        const normTLY = 1 - (rect.cornerPin.topLeft.y / baseHeight) * 2;
-                        const normTRX = (rect.cornerPin.topRight.x / baseWidth) * 2 - 1;
-                        const normTRY = 1 - (rect.cornerPin.topRight.y / baseHeight) * 2;
-                        const normBLX = (rect.cornerPin.bottomLeft.x / baseWidth) * 2 - 1;
-                        const normBLY = 1 - (rect.cornerPin.bottomLeft.y / baseHeight) * 2;
-                        const normBRX = (rect.cornerPin.bottomRight.x / baseWidth) * 2 - 1;
-                        const normBRY = 1 - (rect.cornerPin.bottomRight.y / baseHeight) * 2;
-
-                        // Update corner pin uniforms with normalized coordinates
-                        const cornerPinUniform = gl.getUniformLocation(program, 'cornerPin');
-                        gl.uniform4f(cornerPinUniform, normTLX, normTLY, normTRX, normTRY);
-                        
-                        const cornerPin2Uniform = gl.getUniformLocation(program, 'cornerPin2');
-                        gl.uniform4f(cornerPin2Uniform, normBLX, normBLY, normBRX, normBRY);
-
-                        // Bind and update texture only if needed
-                        gl.activeTexture(gl.TEXTURE0);
-                        gl.bindTexture(gl.TEXTURE_2D, texture);
-                        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, rect.videoElement);
-                        gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
-                    }
-                }
-            }
+        // Get the currently selected rectangle
+        const selectedRect = selectedMarker ? 
+            rectangles.find(r => r.id === parseInt(selectedMarker.dataset.id)) : 
+            null;
+            
+        console.debug('Render state:', {
+            selectedMarkerId: selectedMarker?.dataset.id,
+            selectedRect: selectedRect ? {
+                id: selectedRect.id,
+                isMainTrack: selectedRect.isMainTrack,
+                hasVideo: selectedRect.isMainTrack ? !!videoPreview : !!selectedRect.videoElement,
+                hasLumaMatte: !!selectedRect.lumaMatte,
+                lumaMatteReady: selectedRect.lumaMatte?.video?.readyState > 0
+            } : null
         });
 
-        // Then render main video (higher z-index)
-        if (shouldUpdateTexture) {
-            // Reset corner pin for main video
-            const cornerPinUniform = gl.getUniformLocation(program, 'cornerPin');
-            gl.uniform4f(cornerPinUniform, -1, 1, 1, 1);  // Default corners
-            
-            const cornerPin2Uniform = gl.getUniformLocation(program, 'cornerPin2');
-            gl.uniform4f(cornerPin2Uniform, -1, -1, 1, -1);  // Default corners
+        // Reset texture units
+        gl.activeTexture(gl.TEXTURE0);
+        gl.bindTexture(gl.TEXTURE_2D, null);
+        gl.activeTexture(gl.TEXTURE1);
+        gl.bindTexture(gl.TEXTURE_2D, null);
 
-            gl.activeTexture(gl.TEXTURE0);
+        // Update video texture (unit 0)
+        gl.activeTexture(gl.TEXTURE0);
+        let currentVideo = null;
+        
+        if (selectedRect) {
+            if (selectedRect.isMainTrack) {
+                currentVideo = videoPreview;
+                gl.bindTexture(gl.TEXTURE_2D, videoTexture);
+                gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, videoPreview);
+            } else if (selectedRect.videoElement) {
+                currentVideo = selectedRect.videoElement;
+                const compositeTexture = compositeTextures.get(selectedRect.id);
+                if (compositeTexture) {
+                    gl.bindTexture(gl.TEXTURE_2D, compositeTexture);
+                    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, selectedRect.videoElement);
+                }
+            }
+        } else {
+            currentVideo = videoPreview;
             gl.bindTexture(gl.TEXTURE_2D, videoTexture);
             gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, videoPreview);
-            gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+        }
+        gl.uniform1i(videoTextureUniform, 0);
+
+        // Handle luma matte
+        let hasLumaMatte = false;
+        if (selectedRect && selectedRect.lumaMatte && selectedRect.lumaMatte.video) {
+            const lumaVideo = selectedRect.lumaMatte.video;
+            
+            // Only use luma matte if it's ready
+            if (lumaVideo.readyState > 0) {
+                console.debug('Applying luma matte:', {
+                    rectId: selectedRect.id,
+                    lumaVideoState: {
+                        readyState: lumaVideo.readyState,
+                        currentTime: lumaVideo.currentTime,
+                        paused: lumaVideo.paused,
+                        size: `${lumaVideo.videoWidth}x${lumaVideo.videoHeight}`
+                    },
+                    mainVideoState: {
+                        paused: currentVideo.paused,
+                        currentTime: currentVideo.currentTime
+                    }
+                });
+                
+                // Ensure luma video is playing and synced
+                if (!currentVideo.paused && lumaVideo.paused) {
+                    lumaVideo.currentTime = currentVideo.currentTime;
+                    lumaVideo.play().catch(error => {
+                        console.error('Failed to play luma video:', error);
+                    });
+                }
+
+                // Bind and update luma texture
+                gl.activeTexture(gl.TEXTURE1);
+                gl.bindTexture(gl.TEXTURE_2D, selectedRect.lumaMatteTexture);
+                gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, lumaVideo);
+                gl.uniform1i(lumaTextureUniform, 1);
+                hasLumaMatte = true;
+            }
+        }
+
+        // Update luma matte uniform
+        gl.uniform1f(useLumaMatteUniform, hasLumaMatte ? 1.0 : 0.0);
+        console.debug('Luma matte state:', { hasLumaMatte, useLumaMatteValue: hasLumaMatte ? 1.0 : 0.0 });
+
+        // Update transform uniforms
+        updateTransform();
+
+        // Draw the video frame
+        gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+
+        // Check for WebGL errors
+        const glError = gl.getError();
+        if (glError !== gl.NO_ERROR) {
+            console.error('WebGL error:', glError);
+        }
+
+        // Request next frame if video is playing
+        if (!videoPreview.paused) {
+            requestAnimationFrame(renderFrame);
         }
     } catch (error) {
         console.error('Error in renderFrame:', error);
     }
-    
-    // Use requestAnimationFrame for smoother rendering
-    if (!videoPreview.paused) {
-        requestAnimationFrame(renderFrame);
-    }
 }
 
-// Update the video metadata loaded handler
+// Update the worker message handler
+videoWorker.onmessage = function(e) {
+    const { type, data } = e.data;
+
+    switch (type) {
+        case 'frameProcessed':
+            if (data.shouldRestart) {
+                console.log('Near end, preparing to loop...');
+                videoPreview.currentTime = 0;
+            }
+
+            if (data.bufferInfo) {
+                console.log(`
+                    Buffer State:
+                    - Current Time: ${data.bufferInfo.currentTime}s
+                    - Buffered End: ${data.bufferInfo.bufferedEnd}s
+                    - Duration: ${data.bufferInfo.duration}s
+                    - Buffer %: ${data.bufferInfo.bufferPercentage}%
+                    - Ready State: ${data.bufferInfo.readyState}
+                    - Frame Time: ${data.bufferInfo.frameTime}ms
+                    - Time Diff: ${data.bufferInfo.timeDiff}ms
+                `);
+            }
+
+            // Update UI with proper type conversion
+            if (typeof data.currentTime === 'number') {
+                currentTimeSpan.textContent = formatTime(data.currentTime);
+            }
+            updatePlayhead();
+            break;
+
+        case 'initialized':
+            console.log('Video worker initialized');
+            // Ensure initial time display is valid
+            currentTimeSpan.textContent = formatTime(0);
+            break;
+
+        case 'reset':
+            console.log('Video worker reset');
+            // Reset time display
+            currentTimeSpan.textContent = formatTime(0);
+            break;
+    }
+};
+
+// Update video metadata loaded handler
 videoPreview.addEventListener('loadedmetadata', () => {
     resizeCanvasToFitVideo();
-    // Update duration display
-    durationSpan.textContent = formatTime(videoPreview.duration);
+    // Update duration display with proper type checking
+    const duration = videoPreview.duration;
+    durationSpan.textContent = formatTime(duration);
     createTimelineGrid();
+
+    // Initialize worker with video metadata
+    videoWorker.postMessage({
+        type: 'init',
+        data: {
+            duration: duration,
+            format: videoMetadata.format,
+            shouldLoop: true
+        }
+    });
 });
 
-// Update the timeupdate event listener
-videoPreview.addEventListener('timeupdate', () => {
-    if (videoPreview.paused) {
-        updatePlayhead();
-    }
-    // Update current time display
-    currentTimeSpan.textContent = formatTime(videoPreview.currentTime);
-});
-
-// Update the timeline click handler
-timelineLine.addEventListener('click', (e) => {
-    const rect = timelineLine.getBoundingClientRect();
-    const clickPosition = e.clientX - rect.left;
-    const progress = clickPosition / rect.width;
-    videoPreview.currentTime = progress * videoPreview.duration;
-    currentTimeSpan.textContent = formatTime(videoPreview.currentTime);
-});
-
-// Add window resize handler
-window.addEventListener('resize', () => {
-    resizeCanvasToFitVideo();
-    if (videoPreview.duration) {
-        createTimelineGrid();
-    }
-});
-
-// Load FFmpeg
-async function loadFFmpeg() {
-    try {
-        await ffmpeg.load();
-        isFFmpegLoaded = true;
-        console.log('FFmpeg loaded');
-    } catch (error) {
-        console.error('Error loading FFmpeg:', error);
-    }
-}
-
-// Separate export state tracking
-let isExporting = false;
-
-// Update export function to prevent interference
-async function exportTransformedVideo() {
-    if (isExporting) {
-        console.log('Export already in progress');
-        return;
-    }
-    
-    if (!isFFmpegLoaded) {
-        alert('Please wait for FFmpeg to load');
-        return;
-    }
-
-    if (!videoPreview.src) {
-        alert('Please upload a video first');
-        return;
-    }
-
-    isExporting = true;
-    
-    // Store original playback state
-    const wasPlaying = !videoPreview.paused;
-    const originalTime = videoPreview.currentTime;
-    const originalLoop = videoPreview.loop;
-    
-    try {
-        // Ensure video is ready
-        if (videoPreview.readyState < 2) {
-            await new Promise((resolve) => {
-                videoPreview.addEventListener('loadeddata', resolve, { once: true });
+// Update the onTimeUpdate function
+const onTimeUpdate = () => {
+    if (!videoPreview.paused) {
+        // Send frame data to worker for processing
+        const bufferedRanges = [];
+        for (let i = 0; i < videoPreview.buffered.length; i++) {
+            bufferedRanges.push({
+                start: videoPreview.buffered.start(i),
+                end: videoPreview.buffered.end(i)
             });
         }
 
-        // Setup for frame capture
-        const frameRate = 30;
-        const duration = videoPreview.duration;
-        const totalFrames = Math.floor(duration * frameRate);
-        const frames = [];
-        
-        // Reset video position
-        await new Promise(resolve => {
-            const onSeeked = () => {
-                videoPreview.removeEventListener('seeked', onSeeked);
-                resolve();
-            };
-            videoPreview.addEventListener('seeked', onSeeked);
-            videoPreview.currentTime = 0;
-        });
-
-        console.log('Starting frame capture...');
-        
-        // Capture frames with improved state handling
-        for (let i = 0; i < totalFrames; i++) {
-            try {
-                // Use a more reliable seeking method
-                await new Promise((resolve, reject) => {
-                    const targetTime = i / frameRate;
-                    
-                    const onSeeked = () => {
-                        try {
-                            // Ensure we're at the right frame
-                            if (Math.abs(videoPreview.currentTime - targetTime) > 0.01) {
-                                videoPreview.currentTime = targetTime;
-                                return; // Will trigger another 'seeked' event
-                            }
-                            
-                            videoPreview.removeEventListener('seeked', onSeeked);
-                            
-                            // Wait for the next animation frame to ensure texture is updated
-                            requestAnimationFrame(() => {
-                                // Apply current transformation
-                                updateTransform();
-                                
-                                // Ensure WebGL state is correct
-                                gl.viewport(0, 0, canvas.width, canvas.height);
-                                gl.bindTexture(gl.TEXTURE_2D, videoTexture);
-                                gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, videoPreview);
-                                gl.clear(gl.COLOR_BUFFER_BIT);
-                                gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
-
-                                // Capture the transformed frame
-                                canvas.toBlob((blob) => {
-                                    if (blob) {
-                                        frames.push(blob);
-                                        progressBarFill.style.width = `${(i / totalFrames) * 50}%`;
-                                        resolve();
-                                    } else {
-                                        reject(new Error('Failed to capture frame'));
-                                    }
-                                }, 'image/png', 1.0);
-                            });
-                        } catch (error) {
-                            reject(error);
-                        }
-                    };
-
-                    videoPreview.addEventListener('seeked', onSeeked);
-                    videoPreview.currentTime = targetTime;
-                });
-            } catch (error) {
-                console.error(`Error capturing frame ${i}:`, error);
-                throw error;
+        videoWorker.postMessage({
+            type: 'processFrame',
+            data: {
+                currentTime: videoPreview.currentTime,
+                timestamp: Date.now(),
+                readyState: videoPreview.readyState,
+                buffered: bufferedRanges,
+                duration: videoPreview.duration,
+                paused: videoPreview.paused
             }
-        }
+        });
+    }
+};
 
-        console.log('Frame capture complete. Processing with FFmpeg...');
-
-        // Clear any existing files
-        const files = await ffmpeg.listFiles('/');
-        for (const file of files) {
-            await ffmpeg.deleteFile(file.name);
-        }
-
-        // Write frames to FFmpeg
-        console.log('Writing frames to FFmpeg...');
-        for (let i = 0; i < frames.length; i++) {
-            const frameData = await frames[i].arrayBuffer();
-            const frameName = `frame${i.toString().padStart(6, '0')}.png`;
-            await ffmpeg.writeFile(frameName, new Uint8Array(frameData));
-            progressBarFill.style.width = `${50 + (i / frames.length) * 25}%`;
-        }
-
-        // Combine frames into WebM video with alpha support
-        console.log('Combining frames into video...');
-        await ffmpeg.exec([
-            '-framerate', frameRate.toString(),
-            '-i', 'frame%06d.png',
-            '-c:v', 'vp9',
-            '-pix_fmt', 'yuva420p',
-            '-auto-alt-ref', '0',
-            '-b:v', '2M',
-            '-crf', '30',
-            'output.webm'
-        ]);
-
-        progressBarFill.style.width = '100%';
-
-        // Download the video
-        console.log('Preparing download...');
-        const data = await ffmpeg.readFile('output.webm');
-        const url = URL.createObjectURL(new Blob([data.buffer], { type: 'video/webm' }));
-        const a = document.createElement('a');
-        a.href = url;
-        a.download = 'transformed_video.webm';
-        a.click();
-
-        // Cleanup
-        console.log('Cleaning up...');
-        progressBar.style.display = 'none';
-        const finalFiles = await ffmpeg.listFiles('/');
-        for (const file of finalFiles) {
-            await ffmpeg.deleteFile(file.name);
-        }
-        URL.revokeObjectURL(url);
-    } catch (error) {
-        console.error('Error exporting video:', error);
-        alert('Error exporting video: ' + error.message);
-    } finally {
-        isExporting = false;
-        // Restore original playback state
-        videoPreview.currentTime = originalTime;
-        videoPreview.loop = originalLoop;
-        if (wasPlaying && videoMetadata.format === 'webm') {
-            // For WebM, ensure we have enough buffer before resuming
-            const buffered = videoPreview.buffered;
-            if (buffered.length > 0 && buffered.end(0) >= originalTime + 1) {
-                try {
+// Add the onEnded handler
+const onEnded = async () => {
+    console.log('Video ended at:', videoPreview.currentTime);
+    
+    if (videoMetadata.format === 'webm' && videoMetadata.shouldLoop) {
+        console.log('Restarting WebM playback from beginning');
+        try {
+            // Pause first to ensure clean state
+            videoPreview.pause();
+            
+            // Reset to beginning
+            videoPreview.currentTime = 0;
+            
+            // Wait a frame to ensure the time update has been processed
+            await new Promise(resolve => requestAnimationFrame(resolve));
+            
+            // Check if we have enough buffer to start playing
+            if (videoPreview.buffered.length > 0 && videoPreview.buffered.end(0) > 1) {
                     await videoPreview.play();
-                } catch (e) {
-                    console.error('Failed to restore WebM playback:', e);
-                }
+                videoMetadata.isPlaying = true;
+                playPauseBtn.textContent = '⏸';
             } else {
-                console.log('Waiting for buffer before resuming WebM playback...');
-                // Wait for sufficient buffer
+                // Wait for buffer before playing
                 await new Promise(resolve => {
                     const checkBuffer = () => {
-                        if (videoPreview.buffered.length > 0 && 
-                            videoPreview.buffered.end(0) >= originalTime + 1) {
-                            videoPreview.play().then(resolve).catch(console.error);
+                        if (videoPreview.buffered.length > 0 && videoPreview.buffered.end(0) > 1) {
+                            videoPreview.play()
+                                .then(() => {
+                                    videoMetadata.isPlaying = true;
+                                    playPauseBtn.textContent = '⏸';
+                                    resolve();
+                                })
+                                .catch(error => {
+                                    console.error('Failed to restart after buffering:', error);
+                                    videoMetadata.isPlaying = false;
+                                    playPauseBtn.textContent = '▶';
+                                    resolve();
+                                });
                         } else {
                             setTimeout(checkBuffer, 100);
                         }
@@ -879,309 +838,174 @@ async function exportTransformedVideo() {
                     checkBuffer();
                 });
             }
-        } else if (wasPlaying) {
-            try {
-                await videoPreview.play();
-            } catch (e) {
-                console.error('Failed to restore playback:', e);
-            }
+                            } catch (error) {
+            console.error('Failed to restart WebM playback:', error);
+            videoMetadata.isPlaying = false;
+            playPauseBtn.textContent = '▶';
         }
-        progressBar.style.display = 'none';
+    } else {
+        videoMetadata.isPlaying = false;
+        playPauseBtn.textContent = '▶';
     }
-}
+};
 
-// Add WebM optimization utilities after FFmpeg initialization
-const CHUNK_DURATION = 3; // Duration of each chunk in seconds
-const BUFFER_AHEAD = 2; // Number of chunks to buffer ahead
+// Update video input handler
+videoInput.addEventListener('change', async (event) => {
+    try {
+        const file = event.target.files[0];
+        if (!file) return;
 
-class WebMHandler {
-    constructor() {
-        this.chunks = new Map(); // Store video chunks
-        this.activeChunks = new Set(); // Currently loaded chunks
-        this.isLoading = false;
-        this.mediaSource = null;
-        this.sourceBuffer = null;
-    }
-
-    async initializeMediaSource(videoElement, blob) {
-        this.mediaSource = new MediaSource();
-        videoElement.src = URL.createObjectURL(this.mediaSource);
-
-        await new Promise(resolve => {
-            this.mediaSource.addEventListener('sourceopen', () => {
-                // Use webm MIME type with codecs
-                const mimeType = 'video/webm; codecs="vp8,vorbis"';
-                this.sourceBuffer = this.mediaSource.addSourceBuffer(mimeType);
-                this.sourceBuffer.mode = 'sequence';
-                resolve();
-            }, { once: true });
+        console.log('Loading video file:', {
+            name: file.name,
+            type: file.type,
+            size: file.size
         });
 
-        // Start loading initial chunks
-        await this.loadChunks(blob, 0);
-    }
-
-    async loadChunks(blob, startTime) {
-        if (this.isLoading) return;
-        this.isLoading = true;
-
-        try {
-            const reader = new FileReader();
-            const chunkSize = 1024 * 1024; // 1MB chunks
-            let offset = 0;
-
-            while (offset < blob.size) {
-                const chunk = blob.slice(offset, offset + chunkSize);
-                const buffer = await new Promise((resolve, reject) => {
-                    reader.onload = () => resolve(reader.result);
-                    reader.onerror = reject;
-                    reader.readAsArrayBuffer(chunk);
-                });
-
-                if (!this.sourceBuffer.updating) {
-                    this.sourceBuffer.appendBuffer(buffer);
-                    await new Promise(resolve => {
-                        this.sourceBuffer.addEventListener('updateend', resolve, { once: true });
-                    });
-                }
-
-                offset += chunkSize;
-            }
-
-            // Mark loading complete
-            this.mediaSource.endOfStream();
-        } catch (error) {
-            console.error('Error loading WebM chunks:', error);
-        } finally {
-            this.isLoading = false;
-        }
-    }
-
-    async seekTo(time) {
-        const chunkIndex = Math.floor(time / CHUNK_DURATION);
-        if (!this.chunks.has(chunkIndex)) {
-            // Load the required chunk and its neighbors
-            const startChunk = Math.max(0, chunkIndex - 1);
-            const endChunk = chunkIndex + BUFFER_AHEAD;
-            await this.loadChunksRange(startChunk, endChunk);
-        }
-    }
-
-    async loadChunksRange(startChunk, endChunk) {
-        // Remove chunks that are too far from current playback
-        for (const loadedChunk of this.activeChunks) {
-            if (loadedChunk < startChunk - 1 || loadedChunk > endChunk + 1) {
-                this.activeChunks.delete(loadedChunk);
-            }
-        }
-
-        // Load new chunks
-        for (let i = startChunk; i <= endChunk; i++) {
-            if (!this.activeChunks.has(i)) {
-                this.activeChunks.add(i);
-            }
-        }
-    }
-}
-
-// Add WebM handler to video input handler
-videoInput.addEventListener('change', async (event) => {
-    const file = event.target.files[0];
-    if (file) {
-        const url = URL.createObjectURL(file);
-        const isWebM = file.type === 'video/webm';
-        videoMetadata.format = isWebM ? 'webm' : 'h264';
+        // Reset video state
+        videoPreview.pause();
+        videoPreview.currentTime = 0;
         
+        // Set up video element properties
+        videoPreview.muted = true;
+        videoPreview.playsInline = true;
+        videoPreview.loop = true;
+        videoPreview.crossOrigin = 'anonymous';
+        videoPreview.style.display = 'none'; // Hide video element
+        canvas.style.display = 'block'; // Show canvas
+
+        // Create object URL for video
+        const videoURL = URL.createObjectURL(file);
+        videoPreview.src = videoURL;
+
+        console.log('Waiting for video metadata...');
+        // Wait for metadata to load
+        await new Promise((resolve, reject) => {
+            videoPreview.addEventListener('loadedmetadata', resolve, { once: true });
+            videoPreview.addEventListener('error', reject, { once: true });
+        });
+        console.log('Video metadata loaded');
+
+        // Initialize WebGL if not already initialized
+        if (!gl) {
+            console.log('Initializing WebGL...');
+            initWebGL();
+        }
+
+        // Create video texture if needed
+        if (!videoTexture) {
+            console.log('Creating video texture...');
+            videoTexture = createVideoTexture();
+        }
+
+        // Resize canvas to fit video
+        console.log('Resizing canvas...');
+        resizeCanvasToFitVideo();
+
+        console.log('Waiting for video to be ready...');
+        // Wait for video to be ready to play
+        await new Promise((resolve, reject) => {
+            videoPreview.addEventListener('canplay', resolve, { once: true });
+            videoPreview.addEventListener('error', reject, { once: true });
+        });
+        console.log('Video ready to play');
+
+        // Update UI
+        dropZone.style.display = 'none';
+        playPauseBtn.disabled = false;
+        durationSpan.textContent = formatTime(videoPreview.duration);
+
+        // Start playback and rendering
         try {
-            if (isWebM) {
-                console.log('Loading WebM video with optimized chunking');
-                const webmHandler = new WebMHandler();
-                await webmHandler.initializeMediaSource(videoPreview, file);
+            console.log('Starting video playback...');
+            await videoPreview.play();
+            playPauseBtn.textContent = '⏸';
+            console.log('Starting render loop...');
+            
+            // Start the render loop with continuous updates
+            let animationFrameId;
+            
+            function animate() {
+                // Update texture and render frame
+                gl.activeTexture(gl.TEXTURE0);
+                gl.bindTexture(gl.TEXTURE_2D, videoTexture);
+                gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, videoPreview);
                 
-                // Add enhanced WebM event listeners
-                videoPreview.addEventListener('seeking', async () => {
-                    await webmHandler.seekTo(videoPreview.currentTime);
-                });
-
-                videoPreview.addEventListener('timeupdate', () => {
-                    const currentChunk = Math.floor(videoPreview.currentTime / CHUNK_DURATION);
-                    const bufferedAhead = videoPreview.buffered.end(0) - videoPreview.currentTime;
-                    
-                    // Preload next chunks if buffer is running low
-                    if (bufferedAhead < CHUNK_DURATION * 2) {
-                        webmHandler.loadChunksRange(
-                            currentChunk,
-                            currentChunk + BUFFER_AHEAD
-                        );
-                    }
-                });
-            }
-
-            await new Promise((resolve, reject) => {
-                videoPreview.src = url;
-                videoPreview.crossOrigin = 'anonymous';
-                videoPreview.muted = true;
-                videoPreview.playsInline = true;
-                videoPreview.preload = 'auto';
+                // Clear and render
+                gl.clearColor(0.0, 0.0, 0.0, 1.0);
+                gl.clear(gl.COLOR_BUFFER_BIT);
+                gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
                 
-                // Reset metadata
-                videoMetadata = {
-                    ...videoMetadata,
-                    duration: 0,
-                    keyframeIntervals: [],
-                    lastBufferCheck: 0,
-                    isPlaying: false,
-                    hasAttemptedPlay: false,
-                    lastTimeUpdate: 0,
-                    unexpectedLoops: 0,
-                    preventLoop: false
-                };
-
-                if (isWebM) {
-                    console.log('Loading WebM video with alpha');
-                    videoPreview.autoplay = false;
-                    
-                    // Enhanced buffering progress monitoring
-                    const updateBufferProgress = () => {
-                        if (videoPreview.buffered.length > 0) {
-                            const now = Date.now();
-                            const bufferedEnd = videoPreview.buffered.end(0);
-                            const duration = videoPreview.duration;
-                            const currentTime = videoPreview.currentTime;
-                            
-                            // Log detailed buffer state
-                            console.log(`
-                                Buffer State:
-                                - Current Time: ${currentTime.toFixed(2)}s
-                                - Buffered End: ${bufferedEnd.toFixed(2)}s
-                                - Duration: ${duration.toFixed(2)}s
-                                - Buffer %: ${(bufferedEnd/duration*100).toFixed(1)}%
-                                - Playing: ${!videoPreview.paused}
-                                - Ready State: ${videoPreview.readyState}
-                                - Network State: ${videoPreview.networkState}
-                                - Prevent Loop: ${videoMetadata.preventLoop}
-                            `);
-                        }
-                    };
-                    
-                    videoPreview.addEventListener('timeupdate', () => {
-                        const currentTime = videoPreview.currentTime;
-                        const duration = videoPreview.duration;
-                        const buffered = videoPreview.buffered;
-                        
-                        // Detect unexpected time jumps
-                        if (videoMetadata.lastTimeUpdate > 0 && 
-                            currentTime < videoMetadata.lastTimeUpdate && 
-                            videoMetadata.lastTimeUpdate < duration - 0.1) {
-                            console.log('Detected unexpected time jump back:', 
-                                      videoMetadata.lastTimeUpdate, '->', currentTime);
-                            videoMetadata.unexpectedLoops++;
-                            
-                            // If we detect an unexpected loop, try to restore the position
-                            if (!videoMetadata.preventLoop) {
-                                videoMetadata.preventLoop = true;
-                                videoPreview.currentTime = videoMetadata.lastTimeUpdate;
-                            }
-                        }
-                        
-                        // Update last time for next comparison
-                        videoMetadata.lastTimeUpdate = currentTime;
-                        
-                        // Check if we're near the end
-                        if (currentTime >= duration - 0.1) {
-                            videoPreview.pause();
-                            videoMetadata.isPlaying = false;
-                            playPauseBtn.textContent = '▶';
-                        }
-                        
-                        console.log(`
-                            Playback State:
-                            - Time: ${currentTime.toFixed(2)}s
-                            - Duration: ${duration.toFixed(2)}s
-                            - Playing: ${!videoPreview.paused}
-                            - Unexpected Loops: ${videoMetadata.unexpectedLoops}
-                            - Prevent Loop: ${videoMetadata.preventLoop}
-                        `);
-                    });
-
-                    // Handle seeking
-                    videoPreview.addEventListener('seeking', () => {
-                        console.log('Seeking to:', videoPreview.currentTime);
-                    });
-
-                    videoPreview.addEventListener('seeked', () => {
-                        console.log('Seeked to:', videoPreview.currentTime);
-                        // Reset loop prevention if user manually seeks
-                        if (videoMetadata.preventLoop) {
-                            videoMetadata.preventLoop = false;
-                        }
-                    });
+                // Continue animation if video is playing
+                if (!videoPreview.paused) {
+                    animationFrameId = requestAnimationFrame(animate);
                 }
+            }
+            
+            // Start animation loop
+            animationFrameId = requestAnimationFrame(animate);
+            
+            console.log('Playback started successfully');
+        } catch (playError) {
+            console.error('Error starting playback:', playError);
+            playPauseBtn.textContent = '▶';
+        }
 
-                videoPreview.onerror = (e) => {
-                    console.error('Video error:', e);
-                    console.error('Error code:', videoPreview.error.code);
-                    console.error('Error message:', videoPreview.error.message);
-                    reject(new Error(`Video loading error: ${videoPreview.error.message}`));
-                };
+        console.log('Video setup complete:', {
+            duration: videoPreview.duration,
+            size: `${videoPreview.videoWidth}x${videoPreview.videoHeight}`,
+            type: file.type,
+            readyState: videoPreview.readyState,
+            paused: videoPreview.paused,
+            webglContext: gl ? 'initialized' : 'missing',
+            videoTexture: videoTexture ? 'created' : 'missing'
+        });
+    } catch (error) {
+        console.error('Error setting up video:', error);
+        alert('Error loading video: ' + error.message);
+    }
+});
 
-                videoPreview.onloadedmetadata = async () => {
-                    console.log('Video metadata loaded');
-                    videoMetadata.duration = videoPreview.duration;
-                    console.log(`
-                        Video Metadata:
-                        - Duration: ${videoPreview.duration}s
-                        - Size: ${videoPreview.videoWidth}x${videoPreview.videoHeight}
-                        - Format: ${videoMetadata.format}
-                        - Default Playback Rate: ${videoPreview.defaultPlaybackRate}
-                    `);
-                    
-                    // For WebM, wait for initial buffering
-                    if (isWebM) {
-                        await new Promise(resolve => {
-                            const checkBuffer = () => {
-                                if (videoPreview.buffered.length > 0) {
-                                    const bufferedEnd = videoPreview.buffered.end(0);
-                                    const duration = videoPreview.duration;
-                                    
-                                    // Wait for at least 1 second of buffering or full video
-                                    if (bufferedEnd >= Math.min(1, duration)) {
-                                        resolve();
-                                        return;
-                                    }
-                                }
-                                setTimeout(checkBuffer, 100);
-                            };
-                            checkBuffer();
-                        });
-                    }
+// Update video event listeners
+videoPreview.addEventListener('waiting', () => {
+    console.log('Video waiting for data...');
+});
 
-                    // Hide dropzone and show canvas
-                    dropZone.style.display = 'none';
-                    videoPreview.style.display = 'none';
-                    canvas.style.display = 'block';
-                    
-                    // Initialize video
-                    resizeCanvasToFitVideo();
+videoPreview.addEventListener('canplay', () => {
+    console.log('Video can play');
+    if (videoMetadata.wasPlaying) {
+        videoPreview.play().catch(console.error);
+    }
+});
 
-                    // Start playback
-                    try {
-                        videoMetadata.isPlaying = true;
-                        await videoPreview.play();
-                        playPauseBtn.textContent = '⏸';
-                        requestAnimationFrame(renderFrame);
-                    } catch (e) {
-                        console.error('Playback failed:', e);
-                        videoMetadata.isPlaying = false;
-                    }
-                    resolve();
-                };
-            });
-        } catch (error) {
-            console.error('Error during video setup:', error);
-            alert('Error loading video. Please try again.');
+videoPreview.addEventListener('play', () => {
+    console.log('Video started playing');
+    videoMetadata.isPlaying = true;
+    
+    // Start render loop
+    function animate() {
+        renderFrame();
+        if (!videoPreview.paused) {
+            requestAnimationFrame(animate);
         }
     }
+    requestAnimationFrame(animate);
+});
+
+videoPreview.addEventListener('pause', () => {
+    console.log('Video paused');
+    videoMetadata.isPlaying = false;
+    // Render one last frame to ensure display is updated
+    renderFrame();
+});
+
+videoPreview.addEventListener('seeking', () => {
+    // Render current frame while seeking
+    renderFrame();
+});
+
+videoPreview.addEventListener('seeked', () => {
+    // Update display after seeking completes
+    renderFrame();
 });
 
 // Drag and drop handling
@@ -1201,7 +1025,6 @@ dropZone.addEventListener('drop', (e) => {
     if (file && file.type.startsWith('video/')) {
         videoInput.files = e.dataTransfer.files;
         videoInput.dispatchEvent(new Event('change'));
-        dropZone.style.display = 'none'; // Hide drop zone
     }
 });
 
@@ -1229,10 +1052,12 @@ exportVideoBtn.addEventListener('click', exportTransformedVideo);
 playPauseBtn.addEventListener('click', async () => {
     try {
         if (videoPreview.paused) {
+            videoMetadata.wasPlaying = true;
             await videoPreview.play();
             playPauseBtn.textContent = '⏸';
-            requestAnimationFrame(renderFrame); // Restart render loop
+            requestAnimationFrame(renderFrame);
         } else {
+            videoMetadata.wasPlaying = false;
             videoPreview.pause();
             playPauseBtn.textContent = '▶';
         }
@@ -1241,41 +1066,25 @@ playPauseBtn.addEventListener('click', async () => {
     }
 });
 
-// Add better video state handling
-videoPreview.addEventListener('play', () => {
-    requestAnimationFrame(renderFrame);
-});
-
-videoPreview.addEventListener('pause', () => {
-    // Render one last frame to ensure display is updated
-    renderFrame();
-});
-
-videoPreview.addEventListener('seeking', () => {
-    // Render current frame while seeking
-    renderFrame();
-});
-
-videoPreview.addEventListener('seeked', () => {
-    // Update display after seeking completes
-    renderFrame();
-});
-
 // Update TimelineRectangle class
 class TimelineRectangle {
-    constructor(id) {
+    constructor(id, hasCornerPin = true) {
         this.id = id;
-        this.zIndex = 1; // Default z-index for composite clips
+        this.zIndex = 1;
         this.startFrame = 0;
-        this.endFrame = 30;
-        this.videoSource = null; // Store video source
-        this.videoElement = null; // Store video element
-        this.cornerPin = {
+        this.endFrame = 0;
+        this.videoSource = null;
+        this.videoElement = null;
+        this.isMainTrack = false;
+        this.lumaMatte = null; // Will store { video, source, texture }
+        this.lumaMatteTexture = null;
+        this.hasCornerPin = hasCornerPin;
+        this.cornerPin = hasCornerPin ? {
             topLeft: { x: 0, y: 0 },
             topRight: { x: 1, y: 0 },
             bottomLeft: { x: 0, y: 1 },
             bottomRight: { x: 1, y: 1 }
-        };
+        } : null;
         this.transform = {
             scale: 1,
             rotate: 0,
@@ -1288,31 +1097,26 @@ class TimelineRectangle {
     }
 }
 
-// Timeline state
+// Timeline state - create main track first
 const rectangles = [
-    new TimelineRectangle(1),
+    new TimelineRectangle(1, false), // Main track - no corner pin
     new TimelineRectangle(2),
     new TimelineRectangle(3),
     new TimelineRectangle(4),
     new TimelineRectangle(5)
 ];
 
+// Set main track properties
+rectangles[0].isMainTrack = true;
+rectangles[0].zIndex = 0; // Keep main track at bottom
+
 // Initialize rectangles with z-indices and positions
-rectangles[0].zIndex = 1;
-rectangles[1].zIndex = 2;  // New marker with higher z-index
+rectangles[1].zIndex = 1;
 rectangles[2].zIndex = 1;
 rectangles[3].zIndex = 1;
 rectangles[4].zIndex = 1;
 
-// Set corner pin coordinates for each rectangle
-// Rectangle 1
-rectangles[0].cornerPin = {
-    topLeft: { x: 1974, y: -172 },
-    topRight: { x: 3912, y: 1268 },
-    bottomLeft: { x: 1944, y: 2424 },
-    bottomRight: { x: 4036, y: 2464 }
-};
-
+// Set corner pin coordinates for each rectangle (skip main track)
 // Rectangle 2
 rectangles[1].cornerPin = {
     topLeft: { x: -72, y: 1164 },
@@ -1371,6 +1175,9 @@ let markerStartLeft = 0;
 let isResizing = false;
 let resizeEdge = null;
 
+// Add selection tracking
+let selectedMarker = null;
+
 function createTimelineGrid() {
     const fps = 30; // Frames per second
     const duration = videoPreview.duration || 0;
@@ -1416,141 +1223,119 @@ function createTimelineGrid() {
 function createMarker(rectangle) {
     const marker = document.createElement('div');
     marker.className = 'thumbnail-marker';
+    if (rectangle.isMainTrack) {
+        marker.classList.add('main-track');
+    }
     marker.dataset.id = rectangle.id;
     
     const timelineWidth = 742.74;
     const totalFrames = Math.floor(videoPreview.duration * 30);
     const frameWidth = timelineWidth / totalFrames;
     
-    // Position based on start frame (horizontal)
-    marker.style.left = `${rectangle.startFrame * frameWidth}px`;
-    marker.style.width = `${(rectangle.endFrame - rectangle.startFrame) * frameWidth}px`;
+    if (rectangle.isMainTrack) {
+        marker.style.left = '0';
+        marker.style.width = '100%';
+        marker.style.backgroundColor = 'rgba(40, 40, 40, 0.8)';
+        rectangle.endFrame = totalFrames;
+    } else {
+        marker.style.left = `${rectangle.startFrame * frameWidth}px`;
+        marker.style.width = `${(rectangle.endFrame - rectangle.startFrame) * frameWidth}px`;
+    }
     
-    // Set both z-index for stacking and vertical position
-    marker.style.zIndex = rectangle.zIndex;  // Visual stacking
-    const baseOffset = 0;  // Base vertical position
-    const verticalSpacing = 70;  // Space between rows
-    marker.style.top = `${baseOffset - (rectangle.zIndex - 1) * verticalSpacing}px`;  // Grid position
-
-    // Add video selection button
-    const selectButton = document.createElement('button');
-    selectButton.className = 'select-video-btn';
-    selectButton.textContent = rectangle.videoSource ? '🎥' : '➕';
-    selectButton.title = rectangle.videoSource ? 'Change Video' : 'Add Video';
+    marker.style.zIndex = rectangle.zIndex;
+    const baseOffset = 0;
+    const verticalSpacing = 70;
+    marker.style.top = `${baseOffset - (rectangle.zIndex - 1) * verticalSpacing}px`;
     
-    // Add video input
-    const compositeVideoInput = document.createElement('input');
-    compositeVideoInput.type = 'file';
-    compositeVideoInput.accept = 'video/*';
-    compositeVideoInput.style.display = 'none';
-    
-    // Handle video selection for composite clips
-    compositeVideoInput.addEventListener('change', async (e) => {
-        const file = e.target.files[0];
-        if (file) {
-            const url = URL.createObjectURL(file);
-            const isWebM = file.type === 'video/webm';
-            
-            // Create and set up video element for this clip
-            const video = document.createElement('video');
-            video.src = url;
-            video.muted = true;
-            video.playsInline = true;
-            video.preload = 'auto';
-            video.loop = true;
-            video.crossOrigin = 'anonymous';
-            
-            try {
-                // Wait for video metadata to load
-                await new Promise((resolve) => {
-                    video.onloadedmetadata = resolve;
-                });
+    // Add video selection button for non-main tracks
+    if (!rectangle.isMainTrack) {
+        const selectButton = document.createElement('button');
+        selectButton.className = 'select-video-btn';
+        selectButton.textContent = rectangle.videoSource ? '🎥' : '➕';
+        selectButton.title = rectangle.videoSource ? 'Change Video' : 'Add Video';
+        
+        const compositeVideoInput = document.createElement('input');
+        compositeVideoInput.type = 'file';
+        compositeVideoInput.accept = 'video/*';
+        compositeVideoInput.style.display = 'none';
+        
+        compositeVideoInput.addEventListener('change', (event) => {
+            handleCompositeVideoInput(event.target, rectangle);
+        });
+        
+        selectButton.addEventListener('click', (e) => {
+            e.stopPropagation(); // Prevent marker selection when clicking button
+            compositeVideoInput.click();
+        });
+        
+        marker.appendChild(selectButton);
+        marker.appendChild(compositeVideoInput);
+    }
 
-                // For WebM, ensure proper buffering
-                if (isWebM) {
-                    await new Promise(resolve => {
-                        const checkBuffer = () => {
-                            if (video.buffered.length > 0) {
-                                const bufferedEnd = video.buffered.end(0);
-                                if (bufferedEnd >= video.duration) {
-                                    resolve();
-                                    return;
-                                }
-                            }
-                            setTimeout(checkBuffer, 100);
-                        };
-                        checkBuffer();
-                    });
-
-                    // Ensure we start from the beginning
-                    video.currentTime = 0;
-                    await new Promise(resolve => {
-                        video.onseeked = resolve;
-                    });
-                }
-                
-                // Update rectangle data
-                rectangle.videoSource = url;
-                rectangle.videoElement = video;
-                rectangle.isWebM = isWebM;
-                
-                // Start playing the video
-                await video.play();
-                
-                // Update button appearance
-                selectButton.textContent = '🎥';
-                selectButton.title = 'Change Video';
-                
-                // Add video thumbnail
-                const canvas = document.createElement('canvas');
-                canvas.width = 50;
-                canvas.height = 50;
-                const ctx = canvas.getContext('2d');
-                ctx.drawImage(video, 0, 0, 50, 50);
-                marker.style.backgroundImage = `url(${canvas.toDataURL()})`;
-                marker.classList.add('has-video');
-            } catch (error) {
-                console.error('Error setting up composite video:', error);
-            }
+    // Add selection handling for all markers
+    marker.addEventListener('click', function(e) {
+        // Don't trigger selection when clicking buttons or handles
+        if (e.target !== marker) {
+            e.stopPropagation();
+            return;
         }
-    });
-    
-    // Add resize handles
-    const leftHandle = document.createElement('div');
-    leftHandle.className = 'resize-handle left';
-    const rightHandle = document.createElement('div');
-    rightHandle.className = 'resize-handle right';
-    
-    selectButton.addEventListener('click', () => {
-        compositeVideoInput.click();
-    });
-    
-    marker.appendChild(selectButton);
-    marker.appendChild(compositeVideoInput);
-    marker.appendChild(leftHandle);
-    marker.appendChild(rightHandle);
-    thumbnailMarkers.appendChild(marker);
 
-    // Mouse down handler for dragging
-    marker.addEventListener('mousedown', (e) => {
-        if (e.target === selectButton || e.target === compositeVideoInput) {
-            return; // Don't start drag on button click
+        // Deselect previous marker if any
+        if (selectedMarker && selectedMarker !== marker) {
+            selectedMarker.classList.remove('selected');
+        }
+
+        // Toggle selection
+        if (selectedMarker === marker) {
+            marker.classList.remove('selected');
+            selectedMarker = null;
+            // Force render update with no selection
+            console.debug('Marker deselected');
+            renderFrame();
+        } else {
+            selectedMarker = marker;
+            marker.classList.add('selected');
+            // Force render update with new selection
+            const rect = rectangles.find(r => r.id === parseInt(marker.dataset.id));
+            console.debug('Marker selected:', {
+                id: marker.dataset.id,
+                rectangle: rect ? {
+                    isMainTrack: rect.isMainTrack,
+                    hasVideo: rect.isMainTrack ? !!videoPreview : !!rect.videoElement,
+                    hasLumaMatte: !!rect.lumaMatte,
+                    lumaMatteReady: rect.lumaMatte?.video?.readyState > 0
+                } : null
+            });
+            updatePropertiesPanel(rect);
+            renderFrame();
         }
         
-        if (e.target.classList.contains('resize-handle')) {
-            isResizing = true;
-            resizeEdge = e.target.classList.contains('left') ? 'left' : 'right';
-            currentMarker = marker;
-            startX = e.clientX;
-            e.stopPropagation();
-        } else {
-            isDragging = true;
-            currentMarker = marker;
-            startX = e.clientX;
-            markerStartLeft = parseFloat(marker.style.left);
-        }
-        marker.classList.add('dragging');
+        // Stop event from bubbling to prevent deselection
+        e.stopPropagation();
     });
+
+    // Mouse down handler for dragging (non-main tracks only)
+    if (!rectangle.isMainTrack) {
+        marker.addEventListener('mousedown', (e) => {
+            if (e.target === marker) {
+                isDragging = true;
+                currentMarker = marker;
+                startX = e.clientX;
+                markerStartLeft = parseFloat(marker.style.left);
+                marker.classList.add('dragging');
+            } else if (e.target.classList.contains('resize-handle')) {
+                isResizing = true;
+                resizeEdge = e.target.classList.contains('left') ? 'left' : 'right';
+                currentMarker = marker;
+                startX = e.clientX;
+                e.stopPropagation();
+            }
+        });
+    }
+
+    // Add marker to timeline
+    thumbnailMarkers.appendChild(marker);
+    return marker;
 }
 
 // Update mouse event listeners for dragging and resizing
@@ -1626,4 +1411,635 @@ videoPreview.addEventListener('stalled', () => {
 
 videoPreview.addEventListener('suspend', () => {
     console.log('Video download suspended');
-}); 
+});
+
+// Add WebM optimization utilities after FFmpeg initialization
+const CHUNK_DURATION = 3; // Duration of each chunk in seconds
+const BUFFER_AHEAD = 2; // Number of chunks to buffer ahead
+
+class WebMHandler {
+    constructor() {
+        this.chunks = new Map();
+        this.activeChunks = new Set();
+        this.isLoading = false;
+        this.mediaSource = null;
+        this.sourceBuffer = null;
+        this.pendingOperations = [];
+        this.isSourceOpen = false;
+        this.bufferQueue = [];
+        this.currentUrl = null;
+        this.aborted = false;
+        this.initializationPromise = null;
+        this.usingDirectPlayback = false;
+    }
+
+    async cleanup() {
+        this.aborted = true;
+        
+        if (this.sourceBuffer) {
+            try {
+                if (this.sourceBuffer.updating) {
+                    this.sourceBuffer.abort();
+                }
+            } catch (e) {
+                console.warn('Error aborting source buffer:', e);
+            }
+            this.sourceBuffer = null;
+        }
+
+        if (this.mediaSource && this.mediaSource.readyState === 'open') {
+            try {
+                this.mediaSource.endOfStream();
+            } catch (e) {
+                console.warn('Error ending media source stream:', e);
+            }
+        }
+
+        if (this.currentUrl) {
+            try {
+                URL.revokeObjectURL(this.currentUrl);
+            } catch (e) {
+                console.warn('Error revoking URL:', e);
+            }
+            this.currentUrl = null;
+        }
+
+        this.mediaSource = null;
+        this.isSourceOpen = false;
+        this.pendingOperations = [];
+        this.bufferQueue = [];
+        this.isLoading = false;
+    }
+}
+
+// Initialize WebMHandler
+let currentWebMHandler = new WebMHandler();
+
+// Load FFmpeg
+async function loadFFmpeg() {
+    try {
+        await ffmpeg.load();
+        isFFmpegLoaded = true;
+        console.log('FFmpeg loaded');
+    } catch (error) {
+        console.error('Error loading FFmpeg:', error);
+    }
+}
+
+// Separate export state tracking
+let isExporting = false;
+
+// Export function
+async function exportTransformedVideo() {
+    if (isExporting) {
+        console.log('Export already in progress');
+        return;
+    }
+    
+    if (!isFFmpegLoaded) {
+        alert('Please wait for FFmpeg to load');
+        return;
+    }
+    
+    if (!videoPreview.src) {
+        alert('Please upload a video first');
+        return;
+    }
+    
+    isExporting = true;
+    
+    // Store original playback state
+    const wasPlaying = !videoPreview.paused;
+    const originalTime = videoPreview.currentTime;
+    const originalLoop = videoPreview.loop;
+    
+    try {
+        // Ensure video is ready
+        if (videoPreview.readyState < 2) {
+            await new Promise((resolve) => {
+                videoPreview.addEventListener('loadeddata', resolve, { once: true });
+            });
+        }
+
+        // Setup for frame capture
+        const frameRate = 30;
+        const duration = videoPreview.duration;
+        const totalFrames = Math.floor(duration * frameRate);
+        const frames = [];
+        
+        // Reset video position to start
+        await new Promise(resolve => {
+            const onSeeked = () => {
+                videoPreview.removeEventListener('seeked', onSeeked);
+                resolve();
+            };
+            videoPreview.addEventListener('seeked', onSeeked);
+            videoPreview.currentTime = 0;
+        });
+
+        console.log('Starting frame capture...');
+        
+        // Capture each frame with improved seeking and state handling
+        for (let i = 0; i < totalFrames; i++) {
+            try {
+                await new Promise((resolve, reject) => {
+                    const targetTime = i / frameRate;
+                    const onSeeked = () => {
+                        try {
+                            if (Math.abs(videoPreview.currentTime - targetTime) > 0.01) {
+                                videoPreview.currentTime = targetTime;
+                                return; // wait for correct frame
+                            }
+                            
+                            videoPreview.removeEventListener('seeked', onSeeked);
+                            requestAnimationFrame(() => {
+                                updateTransform();
+                                gl.viewport(0, 0, canvas.width, canvas.height);
+                                gl.bindTexture(gl.TEXTURE_2D, videoTexture);
+                                gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, videoPreview);
+                                gl.clear(gl.COLOR_BUFFER_BIT);
+                                gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+
+                                canvas.toBlob((blob) => {
+                                    if (blob) {
+                                        frames.push(blob);
+                                        progressBarFill.style.width = `${(i / totalFrames) * 50}%`;
+                                        resolve();
+                                    } else {
+                                        reject(new Error('Failed to capture frame'));
+                                    }
+                                }, 'image/png', 1.0);
+                            });
+                        } catch (error) {
+                            reject(error);
+                        }
+                    };
+
+                    videoPreview.addEventListener('seeked', onSeeked);
+                    videoPreview.currentTime = targetTime;
+                });
+            } catch (error) {
+                console.error(`Error capturing frame ${i}:`, error);
+                throw error;
+            }
+        }
+
+        console.log('Frame capture complete. Processing with FFmpeg...');
+
+        // Remove any existing files from FFmpeg's virtual FS
+        const files = await ffmpeg.listFiles('/');
+        for (const file of files) {
+            await ffmpeg.deleteFile(file.name);
+        }
+
+        console.log('Writing frames to FFmpeg...');
+        for (let i = 0; i < frames.length; i++) {
+            const frameData = await frames[i].arrayBuffer();
+            const frameName = `frame${i.toString().padStart(6, '0')}.png`;
+            await ffmpeg.writeFile(frameName, new Uint8Array(frameData));
+            progressBarFill.style.width = `${50 + (i / frames.length) * 25}%`;
+        }
+
+        console.log('Combining frames into video...');
+        await ffmpeg.exec([
+            '-framerate', frameRate.toString(),
+            '-i', 'frame%06d.png',
+            '-c:v', 'vp9',
+            '-pix_fmt', 'yuva420p',
+            '-auto-alt-ref', '0',
+            '-b:v', '2M',
+            '-crf', '30',
+            'output.webm'
+        ]);
+
+        progressBarFill.style.width = '100%';
+
+        console.log('Preparing download...');
+        const data = await ffmpeg.readFile('output.webm');
+        const url = URL.createObjectURL(new Blob([data.buffer], { type: 'video/webm' }));
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = 'transformed_video.webm';
+        a.click();
+
+        console.log('Cleaning up...');
+        progressBar.style.display = 'none';
+        const finalFiles = await ffmpeg.listFiles('/');
+        for (const file of finalFiles) {
+            await ffmpeg.deleteFile(file.name);
+        }
+        URL.revokeObjectURL(url);
+    } catch (error) {
+        console.error('Error exporting video:', error);
+        alert('Error exporting video: ' + error.message);
+    } finally {
+        isExporting = false;
+        // Restore the original playback state
+        videoPreview.currentTime = originalTime;
+        videoPreview.loop = originalLoop;
+        if (wasPlaying && videoMetadata.format === 'webm') {
+            const buffered = videoPreview.buffered;
+            if (buffered.length > 0 && buffered.end(0) >= originalTime + 1) {
+                try {
+                    await videoPreview.play();
+                } catch (e) {
+                    console.error('Failed to restore WebM playback:', e);
+                }
+            } else {
+                console.log('Waiting for buffer before resuming WebM playback...');
+                await new Promise(resolve => {
+                    const checkBuffer = () => {
+                        if (videoPreview.buffered.length > 0 && 
+                            videoPreview.buffered.end(0) >= originalTime + 1) {
+                            videoPreview.play().then(resolve).catch(console.error);
+                        } else {
+                            setTimeout(checkBuffer, 100);
+                        }
+                    };
+                    checkBuffer();
+                });
+            }
+        } else if (wasPlaying) {
+            try {
+                await videoPreview.play();
+            } catch (e) {
+                console.error('Failed to restore playback:', e);
+            }
+        }
+        progressBar.style.display = 'none';
+    }
+}
+
+// Call loadFFmpeg on startup
+loadFFmpeg();
+
+// Add function to update properties panel
+function updatePropertiesPanel(rectangle) {
+    if (!rectangle) return;
+
+    scaleRange.value = rectangle.transform.scale;
+    rotateRange.value = rectangle.transform.rotate;
+    distortRange.value = rectangle.transform.distort;
+    skewXInput.value = rectangle.transform.skewX;
+    skewYInput.value = rectangle.transform.skewY;
+    posXInput.value = rectangle.transform.posX;
+    posYInput.value = rectangle.transform.posY;
+
+    // Only update corner pin if the rectangle has it enabled
+    if (rectangle.hasCornerPin && cornerPinCanvas) {
+        cornerPoints = [
+            rectangle.cornerPin.topLeft,
+            rectangle.cornerPin.topRight,
+            rectangle.cornerPin.bottomLeft,
+            rectangle.cornerPin.bottomRight
+        ];
+        drawCornerPinCanvas();
+    }
+
+    // Update transform display
+    updateTransform();
+
+    // Update luma matte button state
+    if (toggleLumaMatteBtn) {
+        toggleLumaMatteBtn.classList.toggle('active', rectangle.lumaMatte !== null);
+        toggleLumaMatteBtn.textContent = rectangle.lumaMatte ? 'Change Luma Matte' : 'Set Luma Matte';
+    }
+}
+
+// Add function to draw corner pin canvas
+function drawCornerPinCanvas() {
+    const ctx = cornerPinCanvas.getContext('2d');
+    const width = cornerPinCanvas.width;
+    const height = cornerPinCanvas.height;
+
+    // Clear canvas
+    ctx.clearRect(0, 0, width, height);
+
+    // Draw grid
+    ctx.strokeStyle = 'rgba(255, 255, 255, 0.2)';
+    ctx.setLineDash([5, 5]);
+    ctx.beginPath();
+    
+    // Draw corner points and lines
+    ctx.beginPath();
+    ctx.moveTo(cornerPoints[0].x * width, cornerPoints[0].y * height);
+    ctx.lineTo(cornerPoints[1].x * width, cornerPoints[1].y * height);
+    ctx.lineTo(cornerPoints[3].x * width, cornerPoints[3].y * height);
+    ctx.lineTo(cornerPoints[2].x * width, cornerPoints[2].y * height);
+    ctx.closePath();
+    
+    ctx.strokeStyle = '#FFFFFF';
+    ctx.lineWidth = 2;
+    ctx.stroke();
+
+    // Draw corner points
+    cornerPoints.forEach((point, index) => {
+        ctx.beginPath();
+        ctx.arc(point.x * width, point.y * height, 5, 0, Math.PI * 2);
+        ctx.fillStyle = index === activePoint ? '#FF4444' : '#FFFFFF';
+        ctx.fill();
+        ctx.stroke();
+    });
+}
+
+// Update the document click handler
+document.addEventListener('click', function(e) {
+    // Don't deselect if clicking inside a marker, the luma matte button, or other UI controls
+    if (e.target.closest('.thumbnail-marker') || 
+        e.target.closest('.action-buttons') || 
+        e.target.closest('.properties-panel') ||
+        e.target === toggleLumaMatteBtn ||
+        e.target === lumaMatteInput) {
+        return;
+    }
+    
+    // Deselect if clicking outside
+    if (selectedMarker) {
+        selectedMarker.classList.remove('selected');
+        selectedMarker = null;
+        // Force a render to update the display
+        console.debug('Marker deselected by document click');
+        renderFrame();
+    }
+});
+
+// Add luma matte toggle handler
+toggleLumaMatteBtn.addEventListener('click', (e) => {
+    // Prevent event from bubbling up to document
+    e.stopPropagation();
+    
+    if (!selectedMarker) {
+        console.warn('No marker selected when clicking luma matte button');
+        alert('Please select a layer first');
+        return;
+    }
+    
+    const rect = rectangles.find(r => r.id === parseInt(selectedMarker.dataset.id));
+    if (!rect) {
+        console.error('No rectangle found for selected marker ID:', selectedMarker.dataset.id);
+        return;
+    }
+
+    // Check for video based on track type
+    const hasVideo = rect.isMainTrack ? 
+        (videoPreview && videoPreview.readyState > 0) : 
+        !!rect.videoElement;
+
+    if (!hasVideo) {
+        console.warn('Selected rectangle has no video assigned:', {
+            isMainTrack: rect.isMainTrack,
+            hasVideoElement: !!rect.videoElement,
+            mainVideoState: rect.isMainTrack ? {
+                readyState: videoPreview?.readyState,
+                src: videoPreview?.src
+            } : null
+        });
+        alert('Please add a video to this layer before setting a luma matte');
+        return;
+    }
+    
+    console.debug('Opening luma matte file picker for rectangle:', {
+        id: rect.id,
+        isMainTrack: rect.isMainTrack,
+        hasExistingLumaMatte: !!rect.lumaMatte,
+        videoState: rect.isMainTrack ? {
+            width: videoPreview.videoWidth,
+            height: videoPreview.videoHeight,
+            readyState: videoPreview.readyState
+        } : {
+            width: rect.videoElement.videoWidth,
+            height: rect.videoElement.videoHeight,
+            readyState: rect.videoElement.readyState
+        }
+    });
+    
+    lumaMatteInput.click();
+});
+
+// Update luma matte video selection handler
+lumaMatteInput.addEventListener('change', async (event) => {
+    const file = event.target.files[0];
+    if (!file || !selectedMarker) {
+        console.warn('No file selected or no marker selected');
+        return;
+    }
+
+    console.debug('Setting up luma matte:', {
+        file: {
+            name: file.name,
+            type: file.type,
+            size: file.size
+        },
+        selectedMarkerId: selectedMarker.dataset.id
+    });
+
+    try {
+        const rectId = parseInt(selectedMarker.dataset.id);
+        const rect = rectangles.find(r => r.id === rectId);
+        if (!rect) {
+            console.error('No rectangle found for ID:', rectId);
+            return;
+        }
+
+        // Clean up existing luma matte if any
+        if (rect.lumaMatte) {
+            console.debug('Cleaning up existing luma matte');
+            rect.lumaMatte.video.pause();
+            URL.revokeObjectURL(rect.lumaMatte.source);
+            gl.deleteTexture(rect.lumaMatteTexture);
+        }
+
+        // Create video element for luma matte
+        const lumaVideo = document.createElement('video');
+        lumaVideo.muted = true;
+        lumaVideo.loop = true;
+        lumaVideo.playsInline = true;
+        lumaVideo.autoplay = false;
+        lumaVideo.crossOrigin = 'anonymous';
+        
+        // Set up video source
+        const url = URL.createObjectURL(file);
+        lumaVideo.src = url;
+
+        // Wait for metadata to load
+        await new Promise((resolve, reject) => {
+            lumaVideo.addEventListener('loadedmetadata', () => {
+                console.debug('Luma video metadata loaded:', {
+                    size: `${lumaVideo.videoWidth}x${lumaVideo.videoHeight}`,
+                    duration: lumaVideo.duration
+                });
+                resolve();
+            }, { once: true });
+            lumaVideo.addEventListener('error', (e) => {
+                console.error('Luma video load error:', e.target.error);
+                reject(e);
+            }, { once: true });
+        });
+
+        // Create new texture for luma matte
+        rect.lumaMatteTexture = createVideoTexture();
+        console.debug('Created luma matte texture');
+
+        // Store luma matte info
+        rect.lumaMatte = {
+            video: lumaVideo,
+            source: url,
+            texture: rect.lumaMatteTexture
+        };
+
+        // Ensure video is ready to play
+        await new Promise((resolve, reject) => {
+            lumaVideo.addEventListener('canplay', () => {
+                console.debug('Luma video can play');
+                resolve();
+            }, { once: true });
+            lumaVideo.addEventListener('error', (e) => {
+                console.error('Luma video play error:', e.target.error);
+                reject(e);
+            }, { once: true });
+        });
+
+        // Update UI
+        selectedMarker.classList.add('has-luma-matte');
+        toggleLumaMatteBtn.textContent = 'Change Luma Matte';
+        toggleLumaMatteBtn.classList.add('active');
+
+        // Start playing the luma video if main video is playing
+        if (!videoPreview.paused) {
+            console.debug('Starting luma video playback');
+            lumaVideo.currentTime = videoPreview.currentTime;
+            await lumaVideo.play();
+        }
+
+        // Update properties panel without affecting corner pin
+        updatePropertiesPanel(rect);
+        
+        // Force a frame render to show changes
+        requestAnimationFrame(() => {
+            console.debug('Forcing render after luma matte setup:', {
+                rectId: rect.id,
+                hasLumaMatte: !!rect.lumaMatte,
+                lumaMatteReady: rect.lumaMatte?.video?.readyState > 0
+            });
+            renderFrame();
+        });
+
+        console.log('Luma matte setup complete:', {
+            videoReady: lumaVideo.readyState,
+            duration: lumaVideo.duration,
+            size: `${lumaVideo.videoWidth}x${lumaVideo.videoHeight}`,
+            currentTime: lumaVideo.currentTime,
+            mainVideoTime: videoPreview.currentTime
+        });
+    } catch (error) {
+        console.error('Error setting up luma matte:', error);
+        alert('Error setting up luma matte: ' + error.message);
+    }
+});
+
+// Add this function after initWebGL()
+function resizeCanvasToFitVideo() {
+    if (!videoPreview || !videoPreview.videoWidth || !videoPreview.videoHeight) {
+        console.warn('Video dimensions not available');
+        return;
+    }
+    
+    // Get container dimensions
+    const container = canvas.parentElement;
+    const containerWidth = container.clientWidth;
+    const containerHeight = container.clientHeight;
+    
+    console.log('Resizing canvas:', {
+        containerWidth,
+        containerHeight,
+        videoWidth: videoPreview.videoWidth,
+        videoHeight: videoPreview.videoHeight
+    });
+    
+    // Set canvas dimensions to match container
+    canvas.width = containerWidth;
+    canvas.height = containerHeight;
+    
+    // Update WebGL viewport to match canvas size
+    if (gl) {
+        gl.viewport(0, 0, canvas.width, canvas.height);
+        
+        // Clear the canvas
+        gl.clearColor(0.0, 0.0, 0.0, 0.0);
+        gl.clear(gl.COLOR_BUFFER_BIT);
+        
+        // Force a frame render to show the changes
+        renderFrame();
+    }
+}
+
+// Add window resize handler
+window.addEventListener('resize', () => {
+    resizeCanvasToFitVideo();
+});
+
+// Add video error handler
+videoPreview.addEventListener('error', (e) => {
+    console.error('Video error:', e.target.error);
+});
+
+// Update WebGL viewport when canvas is resized
+function updateViewport() {
+    if (gl) {
+        gl.viewport(0, 0, canvas.width, canvas.height);
+        renderFrame();
+    }
+}
+
+// Add resize observer for the canvas
+const resizeObserver = new ResizeObserver(() => {
+    updateViewport();
+});
+resizeObserver.observe(canvas);
+
+// Add composite video input handler
+function handleCompositeVideoInput(input, rectangle) {
+    const file = input.files[0];
+    if (!file) return;
+
+    // Clean up existing video if any
+    if (rectangle.videoElement) {
+        rectangle.videoElement.pause();
+        URL.revokeObjectURL(rectangle.videoSource);
+    }
+
+    // Create new video element
+    const video = document.createElement('video');
+    video.muted = true;
+    video.loop = true;
+    video.playsInline = true;
+    video.crossOrigin = 'anonymous';
+
+    // Set up video source
+    const videoURL = URL.createObjectURL(file);
+    video.src = videoURL;
+
+    // Store video info in rectangle
+    rectangle.videoElement = video;
+    rectangle.videoSource = videoURL;
+
+    // Create texture if needed
+    if (!compositeTextures.has(rectangle.id)) {
+        compositeTextures.set(rectangle.id, createVideoTexture());
+    }
+
+    // Update UI
+    const marker = document.querySelector(`.thumbnail-marker[data-id="${rectangle.id}"]`);
+    if (marker) {
+        const selectButton = marker.querySelector('.select-video-btn');
+        if (selectButton) {
+            selectButton.textContent = '🎥';
+            selectButton.title = 'Change Video';
+        }
+    }
+
+    // Start playing if main video is playing
+    if (!videoPreview.paused) {
+        video.play().catch(console.error);
+    }
+}

@@ -10,7 +10,7 @@
     <style>
         :root {
             --controls-width: 358px;
-            --controls-bg: #737373;
+            --controls-bg: #1b1b1b;
             --preview-bg: #878787;
             --timeline-marker: #D9D9D9;
             --timeline-line: #A3A3A3;
@@ -31,7 +31,7 @@
             width: 100vw;
             height: 100vh;
             overflow: hidden;
-            background: white;
+            background: #131313;
             position: relative;
         }
 
@@ -62,16 +62,13 @@
         }
 
         .video-container {
+            position: relative;
             width: 912.97px;
             height: 513.54px;
-            background: var(--preview-bg);
-            position: relative;
-            display: flex;
-            justify-content: center;
-            align-items: center;
+            background: #1a1a1a;
             overflow: hidden;
-            margin: 0;
-            padding: 0;
+            border-radius: 8px;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
         }
 
         #videoCanvas {
@@ -94,6 +91,7 @@
             height: 111.27px;
             position: relative;
             margin-top: 20px;
+            margin-bottom: 30px;
         }
 
         .timeline {
@@ -110,7 +108,7 @@
             position: absolute;
             left: 114.12px;
             top: 69.91px;
-            background: black;
+            background: white;
             position: relative;
         }
 
@@ -159,7 +157,7 @@
             left: 27.58px;
             top: 47.55px;
             font-size: 28.53px;
-            color: black;
+            color: white;
             display: flex;
             justify-content: space-between;
             width: 916px;
@@ -175,6 +173,7 @@
             display: flex;
             align-items: center;
             justify-content: center;
+            margin-top: 20px;
         }
 
         .export-button {
@@ -202,10 +201,15 @@
             flex-direction: column;
             align-items: center;
             justify-content: center;
-            background: rgba(0, 0, 0, 0.5);
+            background: rgba(0, 0, 0, 0.8);
             color: white;
             gap: 10px;
-            z-index: 10;
+            z-index: 100;
+            transition: background-color 0.3s;
+        }
+
+        #dropZone.dragover {
+            background: rgba(0, 0, 0, 0.9);
         }
 
         #dropZone input[type="file"] {
@@ -213,11 +217,16 @@
         }
 
         #dropZone label {
-            padding: 8px 16px;
-            background: white;
-            color: black;
-            border-radius: 4px;
+            padding: 12px 24px;
+            background: #4A9EFF;
+            color: white;
+            border-radius: 6px;
             cursor: pointer;
+            transition: background-color 0.3s;
+        }
+
+        #dropZone label:hover {
+            background: #3a8eef;
         }
 
         .thumbnail-markers {
@@ -230,20 +239,42 @@
         }
 
         .thumbnail-marker {
-            width: 116.02px;
-            height: 65.62px;
-            background: var(--timeline-marker);
-            opacity: 0.5;
-            border-radius: 14.27px;
-            border: 1.90px solid black;
             position: absolute;
-            cursor: grab;
-            transition: opacity 0.2s;
-            background-size: cover;
-            background-position: center;
-            display: flex;
-            justify-content: center;
-            align-items: center;
+            height: 60px;
+            background-color: rgba(255, 255, 255, 0.1);
+            border: 1px solid rgba(255, 255, 255, 0.3);
+            border-radius: 4px;
+            cursor: pointer;
+            user-select: none;
+            transition: all 0.2s ease;
+        }
+
+        .thumbnail-marker.selected {
+            border: 2px solid #4A9EFF;
+            box-shadow: 0 0 0 2px rgba(74, 158, 255, 0.2);
+            z-index: 10;
+        }
+
+        .thumbnail-marker.main-track {
+            height: 80px;
+            background-color: rgba(40, 40, 40, 0.8);
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            margin-bottom: 20px;
+        }
+
+        .thumbnail-marker.main-track.selected {
+            border: 2px solid #4A9EFF;
+            background-color: rgba(40, 40, 40, 0.9);
+        }
+
+        .thumbnail-marker.main-track::before {
+            content: 'Main Track';
+            position: absolute;
+            left: 10px;
+            top: 5px;
+            color: rgba(255, 255, 255, 0.7);
+            font-size: 12px;
+            font-weight: 500;
         }
 
         .select-video-btn {
@@ -336,7 +367,7 @@
         }
 
         .corner-pin-container h3 {
-            color: black;
+            color: white;
             margin-bottom: 15px;
             font-size: 16px;
         }
@@ -387,7 +418,8 @@
         }
 
         .transform-control label {
-            color: black;
+            color: white;
+            opacity: 0.75;
             width: 80px;
             font-size: 14px;
         }
@@ -398,6 +430,7 @@
             background: #D9D9D9;
             height: 4px;
             border-radius: 2px;
+            opacity: 0.75;
             -webkit-appearance: none;
         }
 
@@ -414,8 +447,9 @@
         .transform-control span {
             width: 50px;
             text-align: right;
-            color: black;
+            color: white;
             font-size: 14px;
+            opacity: 0.75;
         }
 
         .action-buttons {
@@ -430,9 +464,29 @@
             border: none;
             border-radius: 4px;
             background: #D9D9D9;
-            color: black;
+            color: #666666;
             cursor: pointer;
             font-size: 14px;
+        }
+
+        .action-buttons button.active {
+            background: #4A9EFF;
+            color: white;
+        }
+
+        .thumbnail-marker.luma-matte {
+            border: 2px dashed #4A9EFF;
+            background-color: rgba(74, 158, 255, 0.2);
+        }
+
+        .thumbnail-marker.luma-matte::after {
+            content: 'Luma Matte';
+            position: absolute;
+            right: 10px;
+            top: 5px;
+            color: #4A9EFF;
+            font-size: 12px;
+            font-weight: 500;
         }
 
         .playback-controls button {
@@ -457,6 +511,30 @@
             transform: translateX(-50%);
             pointer-events: none;
             z-index: 10;
+        }
+
+        .thumbnail-marker.has-luma-matte {
+            border: 2px solid #4A9EFF;
+            background-color: rgba(74, 158, 255, 0.1);
+        }
+
+        .thumbnail-marker.has-luma-matte::after {
+            content: 'Has Luma Matte';
+            position: absolute;
+            right: 10px;
+            top: 5px;
+            color: #4A9EFF;
+            font-size: 12px;
+            font-weight: 500;
+        }
+
+        #toggleLumaMatte.active {
+            background: #4A9EFF;
+            color: white;
+        }
+
+        #toggleLumaMatte.active:hover {
+            background: #3a8eef;
         }
     </style>
 </head>
@@ -512,6 +590,7 @@
             <button id="applyTransform">Apply Transform</button>
             <button id="exportVideo">Export</button>
             <button id="addOverlay">Add Overlay</button>
+            <button id="toggleLumaMatte">Set as Luma Matte</button>
             <input type="file" id="overlayUpload" accept="video/*" style="display: none;">
         </div>
 
