@@ -39,18 +39,35 @@
             width: var(--controls-width);
             height: 100%;
             position: absolute;
-            left: 0;
+            left: -358px; /* Initially hidden */
             top: 0;
             background: var(--controls-bg);
             padding: 20px;
             overflow-y: auto;
+            transition: left 0.3s ease;
+        }
+
+        .controls-panel.visible {
+            left: 0;
+        }
+
+        .toggle-panel-btn {
+            position: absolute;
+            left: 100%;
+            top: 20px;
+            background: var(--controls-bg);
+            border: none;
+            color: white;
+            padding: 10px;
+            cursor: pointer;
+            border-radius: 0 4px 4px 0;
         }
 
         .main-content {
             position: absolute;
-            left: var(--controls-width);
+            left: 0;
             top: 0;
-            width: calc(100vw - var(--controls-width));
+            width: 100vw;
             height: 100vh;
             padding: 0;
             display: flex;
@@ -59,6 +76,12 @@
             justify-content: center;
             gap: 45.65px;
             margin: 0;
+            transition: left 0.3s ease, width 0.3s ease;
+        }
+
+        .main-content.with-panel {
+            left: var(--controls-width);
+            width: calc(100vw - var(--controls-width));
         }
 
         .video-container {
@@ -178,15 +201,20 @@
 
         .export-button {
             position: absolute;
-            right: 26px;
-            top: 14px;
-            padding: 9px 26px 8px;
+            right: 20px;
+            top: 20px;
+            padding: 12px 30px;
             background: var(--export-btn-bg);
             border-radius: 9px;
             color: white;
-            font-size: 36px;
+            font-size: 24px;
             border: none;
             cursor: pointer;
+            z-index: 1000;
+        }
+
+        .export-button:hover {
+            background: #666666;
         }
 
         canvas {
@@ -540,6 +568,7 @@
 </head>
 <body>
     <div class="controls-panel">
+        <button class="toggle-panel-btn">☰</button>
         <div class="transform-controls">
             <div class="transform-control">
                 <label for="scaleRange">Scale</label>
@@ -588,7 +617,6 @@
 
         <div class="action-buttons">
             <button id="applyTransform">Apply Transform</button>
-            <button id="exportVideo">Export</button>
             <button id="addOverlay">Add Overlay</button>
             <button id="toggleLumaMatte">Set as Luma Matte</button>
             <input type="file" id="overlayUpload" accept="video/*" style="display: none;">
@@ -600,6 +628,7 @@
     </div>
 
     <div class="main-content">
+        <button id="exportVideo" class="export-button">Export</button>
         <div class="video-container">
             <div id="dropZone">
                 <p>Drag & drop your video here or</p>
@@ -629,8 +658,6 @@
             <button id="playPause">▶</button>
         </div>
     </div>
-
-    <button class="export-button">Export</button>
 
     <script type="module" src="/src/main.js"></script>
 </body>

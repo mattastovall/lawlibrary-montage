@@ -1,0 +1,1 @@
+const videoInput = document.getElementById('videoUpload'); const file = new File([new Blob()], 'video.mp4', { type: 'video/mp4' }); const dataTransfer = new DataTransfer(); dataTransfer.items.add(file); videoInput.files = dataTransfer.files; videoInput.dispatchEvent(new Event('change'));
