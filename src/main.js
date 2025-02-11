@@ -10,6 +10,51 @@ let isFFmpegLoaded = false;
 // Initialize video worker
 const videoWorker = new Worker(new URL('./videoWorker.js', import.meta.url), { type: 'module' });
 
+// Initialize playhead sync
+const playheadSync = (() => {
+    let rafId = null;
+    let lastUpdate = 0;
+    const minInterval = 1000 / 30;
+
+    function updatePlayhead(timestamp) {
+        if (!videoPreview || !timelineLine) {
+            cancelAnimationFrame(rafId);
+            return;
+        }
+
+        if (timestamp - lastUpdate >= minInterval) {
+            const progress = videoPreview.currentTime / videoPreview.duration;
+            // Constrain progress between 0 and 1
+            const constrainedProgress = Math.max(0, Math.min(1, progress));
+            // Calculate position while accounting for playhead width
+            const maxPosition = timelineLine.offsetWidth - playheadMarker.offsetWidth;
+            const position = constrainedProgress * maxPosition;
+            // Use left positioning and ensure it stays within bounds
+            playheadMarker.style.left = `${position}px`;
+            currentTimeSpan.textContent = formatTime(videoPreview.currentTime);
+            lastUpdate = timestamp;
+        }
+
+        if (!videoPreview.paused) {
+            rafId = requestAnimationFrame(updatePlayhead);
+        }
+    }
+
+    return {
+        start() {
+            if (rafId) cancelAnimationFrame(rafId);
+            lastUpdate = 0;
+            rafId = requestAnimationFrame(updatePlayhead);
+        },
+        stop() {
+            if (rafId) {
+                cancelAnimationFrame(rafId);
+                rafId = null;
+            }
+        }
+    };
+})();
+
 // WebGL shader sources
 const vertexShaderSource = `
     attribute vec2 position;
@@ -122,8 +167,13 @@ timelineLine.appendChild(playheadMarker);
 function updatePlayhead() {
     if (videoPreview.duration) {
         const progress = videoPreview.currentTime / videoPreview.duration;
-        const timelineWidth = timelineLine.offsetWidth;
-        playheadMarker.style.left = `${progress * timelineWidth}px`;
+        // Constrain progress between 0 and 1
+        const constrainedProgress = Math.max(0, Math.min(1, progress));
+        // Calculate position while accounting for playhead width
+        const maxPosition = timelineLine.offsetWidth - playheadMarker.offsetWidth;
+        const position = constrainedProgress * maxPosition;
+        // Use left positioning and ensure it stays within bounds
+        playheadMarker.style.left = `${position}px`;
         requestAnimationFrame(updatePlayhead);
     }
 }
@@ -175,6 +225,7 @@ let gl;
 let program;
 let videoTexture;
 let lumaTexture;
+let needsRenderUpdate = false;
 let transformMatrix = new Float32Array([
     1, 0, 0, 0,
     0, 1, 0, 0,
@@ -198,14 +249,13 @@ const durationSpan = document.querySelector('.duration');
 // Update the formatTime function to handle NaN and invalid values
 function formatTime(seconds) {
     if (typeof seconds !== 'number' || isNaN(seconds)) {
-        return '0:00.000';
+        return '0:00';
     }
     
     const minutes = Math.floor(Math.max(0, seconds) / 60);
-    const remainingSeconds = Math.max(0, seconds % 60);
-    const milliseconds = Math.floor((remainingSeconds % 1) * 1000);
+    const remainingSeconds = Math.floor(Math.max(0, seconds) % 60);
     
-    return `${minutes}:${Math.floor(remainingSeconds).toString().padStart(2, '0')}.${milliseconds.toString().padStart(3, '0')}`;
+    return `${minutes}:${remainingSeconds.toString().padStart(2, '0')}`;
 }
 
 // Add texture management for composite clips
@@ -651,51 +701,71 @@ function updateTransform() {
             );
         }
     }
+
+    setNeedsRenderUpdate(); // Request render update after transform change
 }
 
 // Update renderFrame function
 function renderFrame() {
-    if (!gl || !videoPreview || !videoTexture) return;
+    if (!gl || !videoPreview || !videoTexture || !needsRenderUpdate) return;
+
+    needsRenderUpdate = false;
 
     try {
-        // 1. Reduce state changes
+        // Use request animation frame more efficiently
+        if (!videoPreview.paused) {
+            requestAnimationFrame(renderFrame);
+        }
+
+        // Batch WebGL state changes
         gl.enable(gl.BLEND);
         gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
-        
-        // 2. Use a single clear call
         gl.clearColor(0.0, 0.0, 0.0, 0.0);
         gl.clear(gl.COLOR_BUFFER_BIT);
 
-        // 3. Pre-sort rectangles by z-index and cache the result
-        if (!window.sortedRectanglesCache) {
+        // Cache sorted rectangles
+        if (!window.sortedRectanglesCache || window.rectanglesDirty) {
             window.sortedRectanglesCache = [...rectangles].sort((a, b) => a.zIndex - b.zIndex);
+            window.rectanglesDirty = false;
         }
 
-        // 4. Batch similar operations
+        // Pre-bind texture units
         gl.activeTexture(gl.TEXTURE0);
+        gl.bindTexture(gl.TEXTURE_2D, videoTexture);
         
+        // Update main video texture only if playing
+        if (!videoPreview.paused) {
+            gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, videoPreview);
+        }
+
+        // Render rectangles efficiently
         for (const rect of window.sortedRectanglesCache) {
             if (!rect.isMainTrack && !rect.videoElement) continue;
             
             const video = rect.isMainTrack ? videoPreview : rect.videoElement;
             if (!video || video.readyState < 2) continue;
 
-            // 5. Minimize uniform updates
+            // Minimize uniform updates
             if (rect.lastUniformState !== rect.isMainTrack) {
                 gl.uniform1f(useCornerPinUniform, rect.isMainTrack ? 0.0 : 1.0);
                 rect.lastUniformState = rect.isMainTrack;
             }
 
-            // 6. Optimize texture updates
-            const mainTexture = rect.isMainTrack ? videoTexture : compositeTextures.get(rect.id);
-            gl.bindTexture(gl.TEXTURE_2D, mainTexture);
+            // Update composite texture only if needed
+            if (!rect.isMainTrack) {
+                const texture = compositeTextures.get(rect.id);
+                if (texture) {
+                    gl.bindTexture(gl.TEXTURE_2D, texture);
+                    if (!video.paused) {
             gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, video);
+                    }
+                }
+            }
 
-            // 7. Handle luma matte more efficiently
+            // Handle luma matte more efficiently
             if (rect.lumaMatte?.video?.readyState >= 2) {
-                // Use the tighter sync threshold
                 const timeDiff = Math.abs(rect.lumaMatte.video.currentTime - video.currentTime);
-                if (timeDiff > LUMA_SYNC_THRESHOLD) {
+                if (timeDiff > 0.033) { // One frame at 30fps
                     rect.lumaMatte.video.currentTime = video.currentTime;
                 }
                 
@@ -709,16 +779,46 @@ function renderFrame() {
                 gl.uniform1f(useLumaMatteUniform, 0.0);
             }
 
+            // Single draw call per rectangle
             gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
-        }
-
-        // 8. Use RAF more efficiently
-        if (!videoPreview.paused) {
-            window.rafId = requestAnimationFrame(renderFrame);
         }
 
     } catch (error) {
         console.error('Error in renderFrame:', error);
+        needsRenderUpdate = true; // Try again next frame
+    }
+}
+
+// Update video timeupdate handler
+const onTimeUpdate = (() => {
+    let lastUpdate = 0;
+    const minInterval = 1000 / 30; // Limit to 30fps
+
+    return () => {
+        const now = performance.now();
+        if (now - lastUpdate < minInterval) return;
+        lastUpdate = now;
+
+        if (!videoPreview.paused) {
+            // Send frame data to worker
+            videoWorker.postMessage({
+                type: 'processFrame',
+                data: {
+                    currentTime: videoPreview.currentTime,
+                    timestamp: now
+                }
+            });
+
+            setNeedsRenderUpdate();
+        }
+    };
+})();
+
+// Add a function to request a render update
+function setNeedsRenderUpdate() {
+    if (!needsRenderUpdate) {
+        needsRenderUpdate = true;
+        requestAnimationFrame(renderFrame);
     }
 }
 
@@ -851,32 +951,6 @@ videoPreview.addEventListener('loadedmetadata', () => {
     // ... rest of your loadedmetadata code ...
 });
 
-// Update the onTimeUpdate function
-const onTimeUpdate = () => {
-    if (!videoPreview.paused) {
-        // Send frame data to worker for processing
-        const bufferedRanges = [];
-        for (let i = 0; i < videoPreview.buffered.length; i++) {
-            bufferedRanges.push({
-                start: videoPreview.buffered.start(i),
-                end: videoPreview.buffered.end(i)
-            });
-        }
-
-        videoWorker.postMessage({
-            type: 'processFrame',
-            data: {
-                currentTime: videoPreview.currentTime,
-                timestamp: Date.now(),
-                readyState: videoPreview.readyState,
-                buffered: bufferedRanges,
-                duration: videoPreview.duration,
-                paused: videoPreview.paused
-            }
-        });
-    }
-};
-
 // Add the onEnded handler
 const onEnded = async () => {
     console.log('Video ended at:', videoPreview.currentTime);
@@ -977,182 +1051,162 @@ videoInput.addEventListener('change', async (event) => {
         }
         videoPreview.currentTime = 0;
 
-        // Show transcoding progress
-        transcodingProgress.style.display = 'block';
-        const progressFill = transcodingProgress.querySelector('.progress-fill');
-        
-        // Set up progress callback
-        segmentManager.setProgressCallback((progress) => {
-            progressFill.style.width = `${progress * 100}%`;
-            console.log('Transcoding progress:', Math.round(progress * 100) + '%');
-        });
-        
-        // Set up video element properties
+        // Show loading indicator
+        const loadingIndicator = document.createElement('div');
+        loadingIndicator.style.cssText = `
+            position: fixed;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            background: rgba(0, 0, 0, 0.8);
+            color: white;
+            padding: 20px;
+            border-radius: 8px;
+            z-index: 1000;
+        `;
+        loadingIndicator.textContent = 'Loading video...';
+        document.body.appendChild(loadingIndicator);
+
+        try {
+            // Set up video element properties first
         videoPreview.muted = true;
         videoPreview.playsInline = true;
         videoPreview.loop = true;
         videoPreview.crossOrigin = 'anonymous';
-        videoPreview.preload = 'auto';
+            videoPreview.preload = 'metadata'; // Start with metadata only
 
-        // Make sure video and canvas are visible
-        videoPreview.style.display = 'block';
-        canvas.style.display = 'block';
+            // Create object URL
+            const videoURL = URL.createObjectURL(file);
+            videoPreview.src = videoURL;
 
-        try {
-            // Initialize FFmpeg if needed
-            if (!segmentManager.isLoaded) {
-                console.log('Initializing FFmpeg...');
-                await segmentManager.initialize();
-            }
-
-            // Initialize adaptive streaming
-            console.log('Initializing adaptive streaming...');
-            await adaptiveStreamingManager.initialize(videoPreview);
-            
-            // Start loading initial segments
-            const videoBlob = new Blob([file], { type: file.type });
-            const initialQuality = adaptiveStreamingManager.getCurrentQuality();
-            
-            console.log('Starting transcoding with quality:', initialQuality);
-            
-            // Generate and append initial segments
-            const segments = await segmentManager.generateSegments(videoBlob, initialQuality);
-            
-            if (!segments || segments.length === 0) {
-                throw new Error('No segments generated');
-            }
-            
-            console.log(`Generated ${segments.length} segments`);
-            
-            // First append initialization segment
-            const initSegment = segments.find(s => s.isInit);
-            if (!initSegment) {
-                throw new Error('No initialization segment found');
-            }
-
-            console.log('Appending initialization segment...');
-            const initSuccess = await adaptiveStreamingManager.appendSegment(initSegment.data, true);
-            if (!initSuccess) {
-                throw new Error('Failed to append initialization segment');
-            }
-            
-            // Then append media segments
-            console.log('Appending media segments...');
-            for (const segment of segments.filter(s => !s.isInit)) {
-                const success = await adaptiveStreamingManager.appendSegment(segment.data, false);
-                if (!success) {
-                    console.warn('Failed to append media segment');
-                }
-            }
-
-            // Hide transcoding progress
-            transcodingProgress.style.display = 'none';
-
-            // Add quality change listener
-            videoPreview.addEventListener('qualitychange', async (e) => {
-                const newQuality = e.detail;
-                console.log('Quality changing to:', newQuality.name);
-                
-                // Show transcoding progress for quality change
-                transcodingProgress.style.display = 'block';
-                progressFill.style.width = '0%';
-                
-                try {
-                    // Generate segments for new quality
-                    const currentTime = videoPreview.currentTime;
-                    const segmentIndex = Math.floor(currentTime / segmentManager.segmentDuration);
-                    const nextSegments = await segmentManager.generateSegments(
-                        videoBlob,
-                        newQuality,
-                        segmentIndex * segmentManager.segmentDuration
-                    );
-                    
-                    // First append initialization segment for new quality
-                    const newInitSegment = nextSegments.find(s => s.isInit);
-                    if (!newInitSegment) {
-                        throw new Error('No initialization segment found for quality change');
-                    }
-                    await adaptiveStreamingManager.appendSegment(newInitSegment.data, true);
-                    
-                    // Then append media segments
-                    for (const segment of nextSegments.filter(s => !s.isInit)) {
-                        await adaptiveStreamingManager.appendSegment(segment.data, false);
-                    }
-                } finally {
-                    // Hide transcoding progress
-                    transcodingProgress.style.display = 'none';
-                }
-            });
-
-            // Initialize WebGL if not already initialized
+            // Initialize WebGL early
             if (!gl) {
                 console.log('Initializing WebGL...');
                 initWebGL();
             }
 
-            // Create video texture if needed
-            if (!videoTexture) {
-                console.log('Creating video texture...');
-                videoTexture = createVideoTexture();
-            }
-
-            // Wait for video to be ready
+            // Wait for minimum video readiness
             await new Promise((resolve, reject) => {
-                const onCanPlay = () => {
+                const timeout = setTimeout(() => {
+                    reject(new Error('Video load timeout'));
+                }, 10000);
+
+                function onCanPlay() {
+                    clearTimeout(timeout);
                     videoPreview.removeEventListener('canplay', onCanPlay);
                     videoPreview.removeEventListener('error', onError);
                     resolve();
-                };
-                const onError = (error) => {
+                }
+
+                function onError(e) {
+                    clearTimeout(timeout);
                     videoPreview.removeEventListener('canplay', onCanPlay);
                     videoPreview.removeEventListener('error', onError);
-                    reject(error);
-                };
+                    reject(e.error || new Error('Video load failed'));
+                }
                 
-                if (videoPreview.readyState >= 3) {
-                    resolve();
-                } else {
                     videoPreview.addEventListener('canplay', onCanPlay);
                     videoPreview.addEventListener('error', onError);
-                }
             });
 
-            // Resize canvas to fit video
-            console.log('Resizing canvas...');
-            resizeCanvasToFitVideo();
+            // Initialize remaining components in parallel
+            const initPromises = [
+                // Initialize FFmpeg in background if needed
+                !isFFmpegLoaded ? ffmpeg.load().catch(console.warn) : Promise.resolve(),
+                
+                // Initialize adaptive streaming in background
+                adaptiveStreamingManager.initialize(videoPreview).catch(console.warn),
+                
+                // Initialize segment manager in background
+                !segmentManager.isLoaded ? segmentManager.initialize().catch(console.warn) : Promise.resolve()
+            ];
 
-            // Update UI
+            // Don't wait for background tasks
+            Promise.all(initPromises).catch(console.warn);
+
+            // Update UI immediately
+            videoPreview.style.display = 'block';
+            canvas.style.display = 'block';
             dropZone.style.display = 'none';
             playPauseBtn.disabled = false;
             durationSpan.textContent = formatTime(videoPreview.duration);
 
-            // Start playback and rendering
-            try {
-                console.log('Starting video playback...');
-                await videoPreview.play();
-                playPauseBtn.textContent = '⏸';
-                console.log('Starting render loop...');
-                requestAnimationFrame(renderFrame);
-                
-                console.log('Playback started successfully');
-            } catch (playError) {
-                console.error('Error starting playback:', playError);
-                playPauseBtn.textContent = '▶';
-            }
-        } catch (error) {
-            console.error('Error in video processing:', error);
-            transcodingProgress.style.display = 'none';
-            // *** IMPORTANT: Cleanup on error ***
-            await cleanupVideoResources(); // Call cleanup here
-            throw error; // Re-throw to be caught by outer catch
+            // Create timeline grid
+            createTimelineGrid();
+
+            // Initialize corner pin
+            initCornerPin();
+
+            // Set up optimized event listeners
+            setupOptimizedEventListeners();
+
+        } finally {
+            // Remove loading indicator
+            loadingIndicator.remove();
         }
 
     } catch (error) {
         console.error('Error setting up video:', error);
         alert('Error loading video: ' + error.message);
-        transcodingProgress.style.display = 'none';
     }
 });
+
+// Add optimized event listener setup
+function setupOptimizedEventListeners() {
+    // Remove any existing listeners
+    const oldListeners = videoPreview._eventListeners || {};
+    Object.entries(oldListeners).forEach(([event, listener]) => {
+        videoPreview.removeEventListener(event, listener);
+    });
+
+    // Store new listeners for cleanup
+    videoPreview._eventListeners = {};
+
+    // Throttled timeupdate handler
+    let timeUpdateTimeout;
+    const onTimeUpdate = () => {
+        if (timeUpdateTimeout) return;
+        timeUpdateTimeout = setTimeout(() => {
+            if (!videoPreview.paused) {
+                setNeedsRenderUpdate();
+            }
+            timeUpdateTimeout = null;
+        }, 1000 / 30); // Cap at 30fps
+    };
+    videoPreview.addEventListener('timeupdate', onTimeUpdate);
+    videoPreview._eventListeners.timeupdate = onTimeUpdate;
+
+    // Optimized play handler
+    const onPlay = () => {
+        playPauseBtn.textContent = '⏸';
+        playheadSync.start();
+        setNeedsRenderUpdate();
+    };
+    videoPreview.addEventListener('play', onPlay);
+    videoPreview._eventListeners.play = onPlay;
+
+    // Optimized pause handler
+    const onPause = () => {
+        playPauseBtn.textContent = '▶';
+        playheadSync.stop();
+    };
+    videoPreview.addEventListener('pause', onPause);
+    videoPreview._eventListeners.pause = onPause;
+
+    // Throttled seeking handler
+    let seekTimeout;
+    const onSeeking = () => {
+        if (seekTimeout) return;
+        seekTimeout = setTimeout(() => {
+            setNeedsRenderUpdate();
+            seekTimeout = null;
+        }, 1000 / 30);
+    };
+    videoPreview.addEventListener('seeking', onSeeking);
+    videoPreview._eventListeners.seeking = onSeeking;
+}
+
+// ... rest of existing code ...
 
 // Update video event listeners
 videoPreview.addEventListener('waiting', () => {
@@ -1189,6 +1243,7 @@ videoPreview.addEventListener('play', () => {
         readyState: videoPreview.readyState
     });
     videoMetadata.isPlaying = true;
+    setNeedsRenderUpdate(); // Request initial render
     
     // Start render loop with error handling
     function animate() {
@@ -1202,6 +1257,12 @@ videoPreview.addEventListener('play', () => {
         }
     }
     requestAnimationFrame(animate);
+});
+
+videoPreview.addEventListener('pause', () => {
+    console.log('Video paused');
+    videoMetadata.isPlaying = false;
+    // No need to cancel RAF here, it will stop automatically
 });
 
 // Add buffer monitoring
@@ -2159,7 +2220,7 @@ lumaMatteInput.addEventListener('change', async (event) => {
         toggleLumaMatteBtn.classList.add('active');
 
         // Force a frame render
-        requestAnimationFrame(renderFrame);
+        setNeedsRenderUpdate(); // Request render update after luma matte change
 
         console.log('Luma matte setup complete');
 
@@ -2438,152 +2499,79 @@ function handleCompositeVideoInput(input, rectangle) {
         rectangle.videoSource = null;
     }).finally(() => {
         // Force a render frame update
-        requestAnimationFrame(renderFrame);
+        setNeedsRenderUpdate(); // Request render update after composite video change
     });
 }
 
 // Add auto-loading functionality for main video and luma matte
 window.addEventListener('load', async () => {
-    console.log('Starting auto-load process...');
+    console.log('Starting video loading process...');
     
-    // Initialize FFmpeg first
     try {
-        if (!isFFmpegLoaded) {
-            console.log('Loading FFmpeg...');
-            await ffmpeg.load();
-            isFFmpegLoaded = true;
-            console.log('FFmpeg loaded successfully');
-        }
-    } catch (error) {
-        console.error('Failed to load FFmpeg:', error);
-        throw new Error('Failed to initialize FFmpeg: ' + error.message);
-    }
+        // Set up video element properties first
+        videoPreview.muted = true;
+        videoPreview.playsInline = true;
+        videoPreview.loop = true;
+        videoPreview.crossOrigin = 'anonymous';
+        videoPreview.preload = 'metadata';
 
-    try {
-        // Initialize segment manager
-        if (!segmentManager.isLoaded) {
-            console.log('Initializing segment manager...');
-            await segmentManager.initialize();
-            console.log('Segment manager initialized');
+        // Try loading video directly
+        videoPreview.src = '/Intro - Montage TopLayer.mp4';  // Updated path to load from public directory
+
+        // Initialize WebGL early
+        if (!gl) {
+            console.log('Initializing WebGL...');
+            initWebGL();
         }
 
-        // Load main video
-        console.log('Fetching main video...');
-        const mainVideoResponse = await fetch('/Intro - Montage TopLayer.mp4');
-        if (!mainVideoResponse.ok) {
-            throw new Error(`Failed to fetch main video: ${mainVideoResponse.status} ${mainVideoResponse.statusText}`);
-        }
-        
-        console.log('Converting main video to blob...');
-        const mainVideoBlob = await mainVideoResponse.blob();
-        console.log('Main video blob size:', mainVideoBlob.size);
-        
-        const mainVideoFile = new File([mainVideoBlob], 'Intro - Montage TopLayer.mp4', { type: 'video/mp4' });
-        
-        // Initialize adaptive streaming
-        console.log('Initializing adaptive streaming...');
-        await adaptiveStreamingManager.initialize(videoPreview);
-        console.log('Adaptive streaming initialized');
-        
-        // Set up video input
-        console.log('Setting up video input...');
-        const dataTransfer = new DataTransfer();
-        dataTransfer.items.add(mainVideoFile);
-        videoInput.files = dataTransfer.files;
-        
-        // Set up progress callback
-        segmentManager.setProgressCallback((progress) => {
-            console.log('Transcoding progress:', Math.round(progress * 100) + '%');
-            const progressFill = transcodingProgress.querySelector('.progress-fill');
-            if (progressFill) {
-                progressFill.style.width = `${progress * 100}%`;
-            }
-        });
-
-        console.log('Dispatching change event...');
-        videoInput.dispatchEvent(new Event('change', { bubbles: true }));
-
-        // Wait for video to be loaded with timeout and progress checks
-        console.log('Waiting for video to be ready...');
+        // Wait for video to be ready
         await new Promise((resolve, reject) => {
             const timeout = setTimeout(() => {
-                const state = {
-                    readyState: videoPreview.readyState,
-                    error: videoPreview.error,
-                    networkState: videoPreview.networkState,
-                    src: videoPreview.src,
-                    currentSrc: videoPreview.currentSrc,
-                    paused: videoPreview.paused,
-                    seeking: videoPreview.seeking,
-                    ended: videoPreview.ended,
-                    muted: videoPreview.muted,
-                    duration: videoPreview.duration,
-                    buffered: videoPreview.buffered.length > 0 ? {
-                        start: videoPreview.buffered.start(0),
-                        end: videoPreview.buffered.end(0)
-                    } : null
-                };
-                console.error('Video load timeout. Current state:', state);
-                reject(new Error('Video load timeout after 30 seconds. Video state: ' + JSON.stringify(state)));
-            }, 30000);
+                reject(new Error('Video load timeout'));
+            }, 10000);
 
-            let lastProgress = 0;
-            const progressInterval = setInterval(() => {
-                if (videoPreview.buffered.length > 0) {
-                    const progress = (videoPreview.buffered.end(0) / videoPreview.duration) * 100;
-                    if (progress !== lastProgress) {
-                        console.log(`Loading progress: ${Math.round(progress)}%`);
-                        lastProgress = progress;
-                    }
-                }
-            }, 500);
+            function onCanPlay() {
+                clearTimeout(timeout);
+                videoPreview.removeEventListener('canplay', onCanPlay);
+                videoPreview.removeEventListener('error', onError);
+                resolve();
+            }
 
-            const checkVideo = () => {
-                console.log('Checking video state:', {
-                    readyState: videoPreview.readyState,
-                    error: videoPreview.error,
-                    networkState: videoPreview.networkState,
-                    src: videoPreview.src,
-                    currentSrc: videoPreview.currentSrc,
-                    buffered: videoPreview.buffered.length > 0 ? {
-                        start: videoPreview.buffered.start(0),
-                        end: videoPreview.buffered.end(0)
-                    } : null
-                });
-                
-                if (videoPreview.error) {
+            function onError(e) {
                     clearTimeout(timeout);
-                    clearInterval(progressInterval);
-                    reject(new Error(`Video error: ${videoPreview.error.message}`));
-                } else if (videoPreview.readyState >= 2) {
-                    clearTimeout(timeout);
-                    clearInterval(progressInterval);
-                    resolve();
-                } else {
-                    setTimeout(checkVideo, 500);
-                }
-            };
-            checkVideo();
+                videoPreview.removeEventListener('canplay', onCanPlay);
+                videoPreview.removeEventListener('error', onError);
+                reject(new Error('Video load failed'));
+            }
 
-            // Add event listeners for debugging
-            videoPreview.addEventListener('loadstart', () => console.log('Video loadstart event fired'));
-            videoPreview.addEventListener('durationchange', () => console.log('Video durationchange event fired'));
-            videoPreview.addEventListener('loadedmetadata', () => console.log('Video loadedmetadata event fired'));
-            videoPreview.addEventListener('loadeddata', () => console.log('Video loadeddata event fired'));
-            videoPreview.addEventListener('progress', () => console.log('Video progress event fired'));
-            videoPreview.addEventListener('canplay', () => console.log('Video canplay event fired'));
-            videoPreview.addEventListener('canplaythrough', () => console.log('Video canplaythrough event fired'));
-            videoPreview.addEventListener('error', (e) => console.error('Video error event:', e.target.error));
+            videoPreview.addEventListener('canplay', onCanPlay);
+            videoPreview.addEventListener('error', onError);
         });
 
-        console.log('Video loaded successfully');
+        // Update UI
+        videoPreview.style.display = 'block';
+        canvas.style.display = 'block';
+        dropZone.style.display = 'none';
+        playPauseBtn.disabled = false;
+        durationSpan.textContent = formatTime(videoPreview.duration);
 
-        // Rest of the auto-loading process...
-        // ... existing code for luma matte loading ...
+        // Create timeline grid
+        createTimelineGrid();
+
+        // Initialize corner pin
+        initCornerPin();
+
+        // Set up optimized event listeners
+        setupOptimizedEventListeners();
 
     } catch (error) {
-        console.error('Error in auto-loading process:', error);
-        // Show error to user with more details
+        console.error('Error loading video:', error);
+        alert('Error loading video: ' + error.message);
+    }
+});
+
+// Helper function to show error dialog
+function showErrorDialog(error) {
         const errorDiv = document.createElement('div');
         errorDiv.style.cssText = `
             position: fixed;
@@ -2603,24 +2591,44 @@ window.addEventListener('load', async () => {
             <h3>Error Loading Video</h3>
             <p style="color: #ff6b6b;">${error.message}</p>
             <pre style="text-align: left; margin: 10px 0; padding: 10px; background: rgba(255,255,255,0.1);">
-Video State:
-- Ready State: ${videoPreview.readyState}
-- Network State: ${videoPreview.networkState}
-- Error: ${videoPreview.error ? videoPreview.error.message : 'None'}
-- Source: ${videoPreview.currentSrc || 'Not set'}
+${error.state ? JSON.stringify(error.state, null, 2) : 'No state information available'}
             </pre>
             <button onclick="this.parentElement.remove()" style="margin-top: 10px; padding: 5px 10px; background: #4a4a4a; border: none; color: white; border-radius: 4px; cursor: pointer;">Close</button>
         `;
         document.body.appendChild(errorDiv);
+}
 
-        // Cleanup on error
-        try {
-            await cleanupVideoResources();
-        } catch (cleanupError) {
-            console.warn('Error during cleanup:', cleanupError);
-        }
-    }
-});
+// Helper function to initialize remaining components
+async function initializeRemainingComponents() {
+    // Initialize timeline
+    createTimelineGrid();
+    
+    // Initialize corner pin
+    initCornerPin();
+    
+    // Set up performance monitoring with reduced frequency
+    setupPerformanceMonitoring();
+}
+
+// Optimize performance monitoring
+function setupPerformanceMonitoring() {
+    let monitoringInterval;
+    
+    videoPreview.addEventListener('play', () => {
+        // Start monitoring only when playing
+        monitoringInterval = setInterval(() => {
+            monitorPlaybackPerformance();
+            monitorSyncPerformance();
+        }, 1000); // Check every second instead of every frame
+    });
+    
+    videoPreview.addEventListener('pause', () => {
+        // Stop monitoring when paused
+        clearInterval(monitoringInterval);
+    });
+}
+
+// ... rest of existing code ...
 
 // Create video sync worker
 const videoSyncWorker = new Worker('/src/video/videoSyncWorker.js');
@@ -2684,11 +2692,23 @@ videoPreview.addEventListener('play', () => {
         type: 'play',
         masterTime: videoPreview.currentTime
     });
-    updatePlayhead();
+    playheadSync.stop();
+    playheadSync.start();
 });
 
 videoPreview.addEventListener('pause', () => {
     videoSyncWorker.postMessage({ type: 'pause' });
+    playheadSync.stop();
+    // Update one last time to ensure accuracy
+    const progress = videoPreview.currentTime / videoPreview.duration;
+    // Constrain progress between 0 and 1
+    const constrainedProgress = Math.max(0, Math.min(1, progress));
+    // Calculate position while accounting for playhead width
+    const maxPosition = timelineLine.offsetWidth - playheadMarker.offsetWidth;
+    const position = constrainedProgress * maxPosition;
+    // Use left positioning and ensure it stays within bounds
+    playheadMarker.style.left = `${position}px`;
+    currentTimeSpan.textContent = formatTime(videoPreview.currentTime);
 });
 
 videoPreview.addEventListener('seeking', () => {
@@ -2889,86 +2909,6 @@ function optimizeEventListeners() {
     });
 }
 
-// Simplified and optimized playhead sync
-function createPlayheadSync() {
-    let rafId = null;
-    const FPS = 30; // Match video frame rate
-    const FRAME_DURATION = 1000 / FPS;
-    let lastUpdateTime = 0;
-
-    function updatePlayhead(timestamp) {
-        if (!videoPreview || !timelineLine) {
-            cancelAnimationFrame(rafId);
-            return;
-        }
-
-        // Only update if enough time has passed (match video frame rate)
-        if (timestamp - lastUpdateTime >= FRAME_DURATION) {
-            const currentTime = videoPreview.currentTime;
-            const progress = currentTime / videoPreview.duration;
-            const timelineWidth = timelineLine.offsetWidth;
-            
-            // Use transform for better performance
-            playheadMarker.style.transform = `translateX(${progress * timelineWidth}px)`;
-            currentTimeSpan.textContent = formatTime(currentTime);
-            
-            lastUpdateTime = timestamp;
-        }
-
-        // Continue animation only if video is playing
-        if (!videoPreview.paused) {
-            rafId = requestAnimationFrame(updatePlayhead);
-        }
-    }
-
-    return {
-        start() {
-            if (rafId) cancelAnimationFrame(rafId);
-            lastUpdateTime = 0;
-            rafId = requestAnimationFrame(updatePlayhead);
-        },
-        stop() {
-            if (rafId) {
-                cancelAnimationFrame(rafId);
-                rafId = null;
-            }
-        }
-    };
-}
-
-// Create single instance of playhead sync
-const playheadSync = createPlayheadSync();
-
-// Update video event listeners
-videoPreview.addEventListener('play', () => {
-    // Clear any existing animation
-    playheadSync.stop();
-    // Start new animation
-    playheadSync.start();
-});
-
-videoPreview.addEventListener('pause', () => {
-    playheadSync.stop();
-    // Update one last time to ensure accuracy
-    const progress = videoPreview.currentTime / videoPreview.duration;
-    const timelineWidth = timelineLine.offsetWidth;
-    playheadMarker.style.transform = `translateX(${progress * timelineWidth}px)`;
-    currentTimeSpan.textContent = formatTime(videoPreview.currentTime);
-});
-
-// Optimize seeking behavior
-videoPreview.addEventListener('seeking', () => {
-    // Update immediately on seek
-    const progress = videoPreview.currentTime / videoPreview.duration;
-    const timelineWidth = timelineLine.offsetWidth;
-    playheadMarker.style.transform = `translateX(${progress * timelineWidth}px)`;
-    currentTimeSpan.textContent = formatTime(videoPreview.currentTime);
-});
-
-// Remove old timeupdate listeners that might conflict
-videoPreview.removeEventListener('timeupdate', updatePlayhead);
-videoPreview.removeEventListener('timeupdate', onTimeUpdate);
-
 // Add sync performance monitoring
 let syncStats = {
     lastUpdate: 0,
@@ -3061,6 +3001,8 @@ videoPreview.addEventListener('play', () => {
     };
     requestAnimationFrame(monitorPlaybackPerformance);
 });
+
+// Note: Using the playheadSync instance declared above
 
 import AdaptiveStreamingManager from './video/adaptiveStreaming.js';
 import VideoSegmentManager from './video/segmentManager.js';

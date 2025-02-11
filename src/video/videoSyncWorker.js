@@ -59,6 +59,9 @@ self.onmessage = function(e) {
 
     const { type, videoId, mediaTime, timestamp, expectedDisplay, time } = e.data;
 
+    // Add logging for every message received
+    console.debug(`[videoSyncWorker] Received message: type=${type}, videoId=${videoId}, mediaTime=${mediaTime}, timestamp=${timestamp}, expectedDisplay=${expectedDisplay}, time=${time}`);
+
     try {
         switch (type) {
             case 'init':
@@ -226,6 +229,9 @@ function checkSync() {
     const masterState = videoStates.get(masterVideoId);
     if (!masterState || !masterState.isPlaying) return;
 
+    // Add logging for sync checks
+    console.debug('[videoSyncWorker] Checking sync...');
+
     // Check sync for all non-master videos
     videoStates.forEach((state, videoId) => {
         if (videoId === masterVideoId) return;
@@ -234,6 +240,9 @@ function checkSync() {
         
         // Send sync adjustment if average drift is significant
         if (Math.abs(state.averageDrift) > 0.005) { // 5ms average drift threshold
+            // Add logging for sync adjustments
+            console.debug(`[videoSyncWorker] Sending sync adjustment: videoId=${videoId}, adjustment=${state.averageDrift}`);
+
             self.postMessage({
                 type: 'sync',
                 videoId,
